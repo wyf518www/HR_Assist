@@ -193,8 +193,14 @@ class Service:
         target=self.storage.path(f"resumes/{safe_filename(role['name']) if role else '待分类'}/{file['sha256'][:16]}_{safe_filename(application['original_name'])}")
         target.parent.mkdir(parents=True,exist_ok=True)
         if not target.exists():
-            with target.open("xb") as output,path.open("rb") as source:
+            staging=self.storage.path(f"temporary/{uid()}.archive-part")
+            with staging.open("xb") as output,path.open("rb") as source:
                 shutil.copyfileobj(source,output)
+                output.flush()
+                os.fsync(output.fileno())
+            if hashlib.sha256(staging.read_bytes()).hexdigest()!=file["sha256"]:
+                raise BusinessError("ARCHIVE_HASH","归档暂存文件校验失败，原件保留。")
+            os.replace(staging,target)
         if hashlib.sha256(target.read_bytes()).hexdigest()!=file["sha256"]:
             raise BusinessError("ARCHIVE_HASH","归档文件校验失败，停止该项处理。")
         if not role:

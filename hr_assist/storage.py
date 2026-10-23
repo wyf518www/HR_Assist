@@ -16,6 +16,9 @@ class BusinessError(Exception):
 
 def safe_filename(name):
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    suffix=Path(name).suffix
+    if len(name)>120 and 0<len(suffix)<=10:
+        name=name[:120-len(suffix)]+suffix
     return (name[:120] or "未命名")
 
 

@@ -101,6 +101,13 @@ def test_classification_and_storage_boundary(service):
         service.storage.path('../../outside')
 
 
+def test_long_original_filename_keeps_parseable_type(service,pdf):
+    result=service.upload_jd(pdf,'Synthetic-'*20+'.pdf')
+    assert 'Python' in result['text']
+    record,path=service.storage.file(result['file_id'])
+    assert path.suffix=='.pdf' and hashlib.sha256(path.read_bytes()).hexdigest()==record['sha256']
+
+
 class FakeModel:
     settings={'model':'test-model'}
     calls=0
