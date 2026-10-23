@@ -1,0 +1,6 @@
+**
+!requirements.txt
+!hr_assist/
+!hr_assist/**
+hr_assist/**/__pycache__/
+hr_assist/**/*.pyc

@@ -1,0 +1,20 @@
+name: Validate HR Assist
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test-and-container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+      - run: node --check hr_assist/web/app.js
+      - run: docker build -t hr-assist:ci .
+      - name: Container authentication, OCR and persistence smoke test
+        run: python scripts/container_smoke.py

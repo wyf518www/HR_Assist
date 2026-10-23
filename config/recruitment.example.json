@@ -1,0 +1,80 @@
+{
+  "schema_version": "0.1-design",
+  "mode": "design_only",
+  "deployment": { "platform": "windows", "audience": "single_user", "bind_host": "127.0.0.1" },
+  "mail": {
+    "account": "",
+    "protocol": "imap_tls",
+    "host": "imap.qq.com",
+    "port": 993,
+    "folder": "INBOX",
+    "credential_ref": null,
+    "subject_keywords": ["【BOSS直聘】", "应聘"],
+    "subject_match_mode": "all",
+    "subject_match_confirmed": false,
+    "first_run_lookback_hours": 24,
+    "use_server_received_time": true,
+    "mark_read": false,
+    "delete_or_move_mail": false
+  },
+  "paths": {
+    "resume_root": "D:\\workbuddy\\简历提取",
+    "jd_directory": "D:\\workbuddy\\简历提取\\岗位JD",
+    "report_directory": "D:\\workbuddy\\简历提取\\推荐",
+    "log_directory": "D:\\workbuddy\\简历提取\\日志",
+    "state_directory": "D:\\workbuddy\\简历提取\\系统数据",
+    "temporary_directory": "D:\\workbuddy\\简历提取\\临时",
+    "quarantine_directory": "D:\\workbuddy\\简历提取\\异常附件",
+    "unclassified_directory": "D:\\workbuddy\\简历提取\\待分类"
+  },
+  "schedule": {
+    "enabled": false,
+    "timezone": "Asia/Shanghai",
+    "daily_time": "09:00",
+    "catch_up_on_resume": true,
+    "prevent_overlapping_runs": true
+  },
+  "classification": {
+    "source": "original_attachment_filename",
+    "rule": "first_fullwidth_bracket_block_then_before_first_underscore",
+    "fallback": "manual_review",
+    "allow_llm_auto_create_role": false
+  },
+  "assessment": {
+    "policy_version": "draft-v1",
+    "weights": { "hard_requirements": 20, "core_skills": 30, "experience": 30, "achievements": 10, "stability": 10 },
+    "thresholds": { "strong_recommend": 85, "recommend": 70, "hold": 60 },
+    "hard_fail_grade_cap": "hold",
+    "hard_unknown_grade_cap": "hold",
+    "sales_role_flag_required": true,
+    "missing_required_jd_action": "block_assessment",
+    "education_policy_confirmed": false,
+    "automatic_rejection": false,
+    "feedback_auto_activate": false
+  },
+  "excel": {
+    "path": "D:\\workbuddy\\简历提取\\推荐\\招聘推荐总览.xlsx",
+    "manual_source_of_truth": "excel",
+    "manual_columns": ["推荐给部门日期", "面试日期", "简历是否通过用人部门筛选", "面试评价", "当前状态"],
+    "sort": [{ "column": "推荐日期", "direction": "descending" }, { "column": "岗位名称", "direction": "ascending" }],
+    "stable_hidden_row_key": "_application_id",
+    "on_locked_or_conflict": "defer_write_and_notify"
+  },
+  "llm": {
+    "deployment": "company_approved_cloud",
+    "provider": null,
+    "endpoint": null,
+    "model": null,
+    "credential_ref": null,
+    "approval_record_ref": null,
+    "outbound_enabled": false,
+    "redact_direct_identifiers": true,
+    "upload_original_pdf": false,
+    "use_candidate_data_for_training": false,
+    "request_timeout_seconds": 90,
+    "max_retries": 2,
+    "daily_budget_cny": null
+  },
+  "notification": { "local_inbox": true, "windows_toast": true, "external_channels_enabled": false },
+  "privacy": { "retention_days": null, "retention_policy_confirmed": false, "plain_logs_include_resume_text": false }
+}
