@@ -43,6 +43,13 @@ def test_single_instance_lock(service,environment):
         Service(environment)
 
 
+def test_chunked_upload_limit(environment):
+    from dataclasses import replace
+    with TestClient(create_app(replace(environment,max_upload_bytes=10))) as client:
+        response=client.post('/api/resumes',content=(b'x'*1024*1024 for _ in range(2)))
+        assert response.status_code==413
+
+
 def test_role_version_and_missing_jd(service,role_data):
     incomplete=deepcopy(role_data);incomplete['fields']['skills']=''
     with pytest.raises(BusinessError,match='JD 缺失项'):
@@ -52,6 +59,10 @@ def test_role_version_and_missing_jd(service,role_data):
     second=service.save_role(RoleInput(**role_data),first['id'])
     assert first['current_version']!=second['current_version']
     assert len(service.db.all('SELECT * FROM jd_versions'))==2
+    role_data['criteria']=second['criteria']
+    role_data['fields']['skills']='Python, SQL, Docker'
+    third=service.save_role(RoleInput(**role_data),first['id'])
+    assert next(c for c in third['criteria'] if c['id']=='skills')['description']=='Python, SQL, Docker'
 
 
 def test_file_parsing_archive_dedup_and_blocked_model(service,role,pdf):

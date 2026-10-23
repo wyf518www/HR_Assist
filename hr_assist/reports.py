@@ -195,7 +195,7 @@ def overview_export(db, storage):
         values=[row["role_name"] or "待分类",row["recommended_at"] or "",row["name"],result.get("score"),result.get("grade",""),
                 facts.get("company",""),facts.get("experience",""),"；".join(result.get("advantages",[])),
                 "；".join(result.get("risks",[])) or ("JD缺失项：岗位要求未补齐或尚未确认，停止评估" if row["status"]=="WAITING_JD" else row["status"] if not result else result.get("gate_reason","")),
-                "\n".join(refs) or "尚未评估，请在工作台处理待办。"]
+                ("暂计分；存在未知信息，请人工核验。\n" if result.get("provisional") else "")+("\n".join(refs) or "尚未评估，请在工作台处理待办。")]
         for column,value in enumerate(values,1):
             if column==4:
                 sheet.cell(index,column,value)

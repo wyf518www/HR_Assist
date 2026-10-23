@@ -49,18 +49,22 @@ class CloudModel:
             raise BusinessError("MODEL_NOT_CONFIGURED", "请先配置并批准云模型接口。")
         try:
             with httpx.Client(timeout=self.settings.get("timeout_seconds",90), follow_redirects=False) as client:
-                response=client.post(self.settings["endpoint"],headers={"Authorization":f"Bearer {self.api_key}"},json={
+                with client.stream("POST",self.settings["endpoint"],headers={"Authorization":f"Bearer {self.api_key}"},json={
                     "model":self.settings["model"],"temperature":0,
                     "messages":[{"role":"system","content":system},{"role":"user","content":dump(payload)}],
                     "response_format":{"type":"json_object"},
-                })
-            response.raise_for_status()
-            if len(response.content)>1_000_000:
-                raise BusinessError("MODEL_OUTPUT_LIMIT", "模型响应超出大小限制。")
-            content=response.json()["choices"][0]["message"]["content"]
+                }) as response:
+                    response.raise_for_status()
+                    body=bytearray()
+                    for chunk in response.iter_bytes():
+                        body.extend(chunk)
+                        if len(body)>1_000_000:
+                            raise BusinessError("MODEL_OUTPUT_LIMIT", "模型响应超出大小限制。")
+            response_data=json.loads(body)
+            content=response_data["choices"][0]["message"]["content"]
             result=json.loads(content)
-            return result, response.json().get("usage",{})
-        except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
+            return result, response_data.get("usage",{})
+        except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
             # Never include upstream request, response, headers or credentials in errors/logs.
             raise BusinessError("MODEL_FAILED", "模型调用失败或未返回有效 JSON，请检查服务配置后重试。") from exc
 
@@ -132,8 +136,10 @@ def validate_and_score(raw, spans, criteria, policy, is_sales):
             admission=facts.get("admission","")
             if not school or not admission or not policy.get("schools"):
                 education_gate="unknown"
-            elif admission!="统招" or school not in policy["schools"]:
+            elif school not in policy["schools"] or admission in {"非统招","自考","成人教育","函授"}:
                 education_gate="fail"
+            elif admission not in {"统招","全日制统招","统招本科","普通高等教育统招"}:
+                education_gate="unknown"
             gate_reason="本科须有统招原文证据，院校须匹配用户已核验名录。"
         else:
             education_gate="unknown"

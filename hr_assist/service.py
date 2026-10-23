@@ -76,6 +76,8 @@ class Service:
         return rows
 
     def save_role(self,data,identity=None):
+        if self.run_lock.locked():
+            raise BusinessError("RUN_BUSY","请等待当前任务完成后修改岗位 JD。",409)
         fields=data.fields.model_dump()
         missing=[FIELD_LABELS[k] for k,v in fields.items() if not v.strip()]
         if not data.jd_text.strip():
@@ -159,6 +161,8 @@ class Service:
         return row
 
     def classify(self,identity,role_id):
+        if self.run_lock.locked():
+            raise BusinessError("RUN_BUSY","请等待当前任务完成后确认岗位。",409)
         application=self.get_application(identity)
         if application["role_id"]:
             raise BusinessError("ROLE_ALREADY_ASSIGNED","已有岗位的申请不改写历史；请将原件作为另一个岗位的新投递导入。")
@@ -251,7 +255,7 @@ class Service:
         return self.db.one("SELECT * FROM runs WHERE id=?",(identity,))
 
     def _run(self,run_id,mode):
-        stats={"emails":0,"new_resumes":0,"duplicates":0,"archived":0,"assessed":0,"reused":0,"exceptions":0,"reports":0,"grades":{},"roles":{}}
+        stats={"emails":0,"new_resumes":0,"duplicates":0,"archived":0,"assessed":0,"reused":0,"exceptions":0,"reports":0,"grades":{g:0 for g in ("强烈推荐","推荐","待定","不推荐")},"roles":{}}
         cutoff=datetime.now(timezone.utc)
         cursor=self.db.get("mail_cursor",{})
         start=datetime.fromisoformat(cursor["cutoff"]) if cursor.get("cutoff") else cutoff-timedelta(hours=24)
@@ -304,11 +308,10 @@ class Service:
                 if application["assessment_id"]:
                     continue
                 prior=self.db.one("SELECT status FROM documents WHERE file_id=?",(application["file_id"],))
+                if not prior:
+                    stats["new_resumes"]+=1
                 try:
                     spans,jd=self.parse_application(application)
-                    parsed=self.db.one("SELECT status FROM documents WHERE file_id=?",(application["file_id"],))
-                    if parsed and parsed["status"]=="PARSED" and (not prior or prior["status"]=="FAILED"):
-                        stats["new_resumes"]+=1
                     archive_key="archived:"+application["id"]
                     if application["role_id"] and not self.db.get(archive_key):
                         stats["archived"]+=1

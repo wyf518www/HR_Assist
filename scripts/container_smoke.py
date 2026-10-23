@@ -49,8 +49,11 @@ assert any(s['source']=='ocr' and 'Python' in s['text'] for s in spans), spans
 print('OCR raster PDF passed')
 """
     print(docker('exec',name,'python','-c',code))
+    marker=secrets.token_hex(16)
+    docker('exec',name,'python','-c',"from pathlib import Path; from hr_assist.db import Database; Database(Path('/state')).put('ci_persistence', '"+marker+"')")
     docker('restart',name);wait()
     with urllib.request.urlopen(request) as response:assert response.status==200
+    assert docker('exec',name,'python','-c',"from pathlib import Path; from hr_assist.db import Database; print(Database(Path('/state')).get('ci_persistence'))")==marker
     print('Container auth, OCR and persisted administrator passed')
 finally:
     subprocess.run(['docker','rm','-fv',name],stdout=subprocess.DEVNULL,check=False)
