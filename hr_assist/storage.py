@@ -22,17 +22,6 @@ def safe_filename(name):
     return (name[:120] or "未命名")
 
 
-def classify_filename(name):
-    groups = re.findall(r"【([^】]*)】", name)
-    if not groups:
-        return None, ""
-    jobs = {block.split("_", 1)[0].strip() for block in groups}
-    if len(jobs) != 1 or not next(iter(jobs)):
-        return None, ""
-    parts = groups[0].split("_")
-    return next(iter(jobs)), parts[1].strip() if len(parts) > 1 else ""
-
-
 def validate_zip(data):
     try:
         with zipfile.ZipFile(BytesIO(data)) as archive:

@@ -27,7 +27,7 @@ class JDFields(Input):
 class Criterion(Input):
     id: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,50}$")
     dimension: Literal["hard", "skills", "experience", "achievements", "stability"]
-    description: str = Field(min_length=1, max_length=3000)
+    description: str = Field(min_length=1, max_length=6000)
     points: int = Field(ge=1, le=30)
     hard: bool = False
     source: Literal["jd", "policy"] = "jd"
@@ -65,11 +65,17 @@ class SettingsInput(Input):
     llm_endpoint: str = Field(default="", max_length=500)
     llm_model: str = Field(default="", max_length=200)
     llm_api_key: str | None = Field(default=None, max_length=2000)
+    llm_timeout_seconds: int | None = Field(default=None, ge=30, le=600)
+    llm_reasoning_effort: Literal["default", "low", "high", "max"] | None = None
+    llm_max_tokens: int | None = Field(default=None, ge=1024, le=131072, strict=True)
     llm_approved: bool = False
     approval_note: str = Field(default="", max_length=2000)
     max_calls_per_run: int = Field(default=30, ge=1, le=200)
     schedule_enabled: bool = False
     schedule_time: str = "09:00"
+    diagnostics_enabled: bool | None = None
+    diagnostics_retention_days: int | None = Field(default=None, ge=1, le=30)
+    diagnostics_cleanup_time: str | None = None
     policy_confirmed: bool = False
     master_bypass: bool = True
     schools: list[str] = Field(default_factory=list, max_length=600)
@@ -77,8 +83,12 @@ class SettingsInput(Input):
 
     @model_validator(mode="after")
     def check(self):
+        if "llm_reasoning_effort" in self.model_fields_set and self.llm_reasoning_effort is None:
+            raise ValueError("思考强度不能为空；恢复供应商默认请选 default")
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", self.schedule_time):
             raise ValueError("计划时间格式必须为 HH:MM")
+        if self.diagnostics_cleanup_time is not None and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", self.diagnostics_cleanup_time):
+            raise ValueError("日志清理时间格式必须为 HH:MM")
         if self.llm_endpoint:
             parsed = urlsplit(self.llm_endpoint)
             if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.query or parsed.fragment:
@@ -92,8 +102,29 @@ class SettingsInput(Input):
         return self
 
 
+class JDImportConfirm(Input):
+    role: RoleInput
+    reviewed: Literal[True]
+    target_role_id: str | None = None
+    expected_version: str | None = None
+
+
+class JDTextAnalysis(Input):
+    text: str = Field(min_length=1, max_length=100_000)
+    confirmed: Literal[True]
+
+
 class ClassifyInput(Input):
     role_id: str
+
+
+class RoleAction(Input):
+    confirmed: Literal[True]
+    expected_version: str = Field(min_length=1, max_length=100)
+
+
+class RoleStatusInput(RoleAction):
+    active: bool
 
 
 class DocumentReview(Input):
@@ -102,9 +133,83 @@ class DocumentReview(Input):
     confirmed: Literal[True]
 
 
+class CandidateNameReview(Input):
+    name: str = Field(min_length=1, max_length=80)
+    expected_name: str = Field(max_length=500)
+    confirmed: Literal[True]
+
+    @model_validator(mode="after")
+    def check_name(self):
+        if self.name.strip() != self.name or self.name == "待确认" or re.search(r"[<>\x00-\x1f\x7f]", self.name):
+            raise ValueError("请填写已对照原始 PDF 核验的姓名，不含首尾空格或控制字符")
+        return self
+
+
 class RunInput(Input):
-    mode: Literal["mail", "pending"] = "pending"
+    mode: Literal["mail", "pending", "identity"] = "pending"
     idempotency_key: str = Field(min_length=8, max_length=100)
+    application_ids: list[str] = Field(default_factory=list,max_length=500)
+    force_identity: bool = False
+
+
+class IdentityCorrection(Input):
+    application_id: str = Field(min_length=1,max_length=100)
+    proposal_id: str = Field(min_length=1,max_length=100)
+    name: str = Field(min_length=1,max_length=80)
+    role_id: str = Field(min_length=1,max_length=100)
+
+    @model_validator(mode='after')
+    def validate_name(self):
+        if self.name.strip()!=self.name or self.name in {'待确认','待识别'} or re.search(r'[<>\x00-\x1f\x7f]',self.name):
+            raise ValueError('请填写经核对的候选人姓名或原文称呼')
+        return self
+
+
+class IdentityCorrections(Input):
+    confirmed: Literal[True]
+    items: list[IdentityCorrection] = Field(min_length=1,max_length=500)
+
+    @model_validator(mode='after')
+    def unique_applications(self):
+        if len({i.application_id for i in self.items})!=len(self.items):
+            raise ValueError('同一申请只能出现一次')
+        return self
+
+
+class FollowupInput(Input):
+    expected_revision: int = Field(ge=0)
+    changes: dict[str, str | None] = Field(min_length=1, max_length=5)
+
+    @model_validator(mode="after")
+    def check_followup(self):
+        allowed={"推荐给用人部门日期","用人部门复筛结果","约面时间","面试状态","面试结果"}
+        if not set(self.changes) <= allowed or any(v is not None and len(v)>40 for v in self.changes.values()):
+            raise ValueError('仅支持编辑指定的五个跟进字段')
+        return self
+
+
+class FollowupBatchItem(Input):
+    application_id: str = Field(min_length=1,max_length=100)
+    expected_revision: int = Field(ge=0)
+
+
+class FollowupBatchInput(Input):
+    confirmed: Literal[True]
+    items: list[FollowupBatchItem] = Field(min_length=1,max_length=500)
+    fields: dict[str,str | None] = Field(min_length=1,max_length=7)
+
+    @model_validator(mode='after')
+    def check_batch(self):
+        if len({item.application_id for item in self.items})!=len(self.items):
+            raise ValueError('同一申请只能出现一次')
+        free_text={'面试评价','当前状态'}
+        allowed={'推荐给用人部门日期','用人部门复筛结果','约面时间','面试状态','面试结果',*free_text}
+        if not set(self.fields)<=allowed:
+            raise ValueError('仅支持编辑指定的七个人工跟进字段')
+        for column,value in self.fields.items():
+            if value is not None and len(value)>(20_000 if column in free_text else 40):
+                raise ValueError('人工跟进字段过长')
+        return self
 
 
 class Evidence(Input):

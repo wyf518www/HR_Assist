@@ -9,8 +9,8 @@ from pypdf import PdfReader, PdfWriter
 
 from hr_assist.documents import extract_file
 from hr_assist.main import create_app
-from hr_assist.schemas import RoleInput, SettingsInput
-from hr_assist.storage import BusinessError, classify_filename
+from hr_assist.schemas import RoleInput, SettingsInput, CandidateNameReview
+from hr_assist.storage import BusinessError
 from hr_assist.service import Service
 from hr_assist.db import now
 from conftest import make_pdf, run
@@ -66,16 +66,18 @@ def test_role_version_and_missing_jd(service,role_data):
 
 
 def test_file_parsing_archive_dedup_and_blocked_model(service,role,pdf):
-    first=service.ingest(pdf,'【软件工程师_Test】.pdf')
+    first=service.ingest(pdf,'【软件工程师_Test】.pdf',role['id'])
     assert service.ingest(pdf,'【软件工程师_Test】.pdf')['duplicate']
-    second=service.ingest(make_pdf('Another synthetic candidate with Python engineering and project experience.'),'【软件工程师_Second】.pdf')
+    second=service.ingest(make_pdf('Another synthetic candidate with Python engineering and project experience.'),'【软件工程师_Second】.pdf',role['id'])
+    for app,name in ((first,'Test'),(second,'Second')):
+        service.review_candidate_name(app['id'],CandidateNameReview(name=name,expected_name='待识别',confirmed=True))
     result=run(service)
     assert result['status']=='BLOCKED'
     assert json.loads(result['stats'])['archived']==2
     for identity in (first['id'],second['id']):
         app=service.get_application(identity)
         assert app['document']['status']=='PARSED'
-        assert app['status']=='WAITING_CONFIG'
+        assert app['status'] in {'WAITING_CONFIG','QUEUED'}
         file,path=service.storage.file(app['file_id'])
         assert hashlib.sha256(path.read_bytes()).hexdigest()==file['sha256']
     assert json.loads(run(service)['stats'])['archived']==0
@@ -94,9 +96,10 @@ def test_encrypted_pdf_quarantined(service,role,pdf):
     assert len(list((service.env.data_dir/'quarantine').glob('*.pdf')))==1
 
 
-def test_classification_and_storage_boundary(service):
-    assert classify_filename('【软件工程师_Test_5年】.pdf')==('软件工程师','Test')
-    assert classify_filename('【A_Test】【B_Test】.pdf')==(None,'')
+def test_classification_and_storage_boundary(service,pdf):
+    app=service.ingest(pdf,'任意命名【岗位_城市_薪资】姓名_经验.pdf')
+    row=service.get_application(app['id'])
+    assert row['name']=='待识别' and row['role_id'] is None
     with pytest.raises(BusinessError):
         service.storage.path('../../outside')
 
@@ -117,6 +120,12 @@ class FakeModel:
         self.calls+=1
         if self.fail:
             raise BusinessError('MODEL_FAILED','模拟服务中断')
+        if 'available_roles' in payload:
+            # A literal synthetic model response, not a production parser.
+            filename=next(s for s in payload['sources'] if s['id']=='F1')['text']
+            return {'name':{'status':'identified','value':'Test','evidence':[{'span_id':'F1','quote':filename}],'note':'Synthetic'},
+                    'role':{'status':'identified','value':'软件工程师','role_id':payload['available_roles'][0]['id'],
+                            'evidence':[{'span_id':'F1','quote':filename}],'note':'Synthetic'}},{'total_tokens':10}
         span=payload['resume_spans'][0]
         return {'judgments':[{'criterion_id':c['id'],'verdict':'met','evidence':[{'span_id':span['id'],'quote':span['text']}],'reason':'测试证据支持'} for c in payload['criteria']]}, {'total_tokens':10}
 

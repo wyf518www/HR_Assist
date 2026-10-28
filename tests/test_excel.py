@@ -34,8 +34,8 @@ def test_real_excel_roundtrip_formulas_dates_and_overview(service,application):
     assert sheet['K2'].value==datetime(2026,10,23)
     assert sheet['M2'].value=='通过' and sheet['N2'].value=='=1+1' and sheet['N2'].data_type=='f'
     assert sheet['O2'].value=='安排面试'
-    assert sheet.column_dimensions['P'].hidden
-    assert len(sheet[1])==16
+    assert sheet.column_dimensions['R'].hidden
+    assert len(sheet[1])==18
     assert json.loads(service.db.one('SELECT cells FROM followups')['cells'])[3]['value']=='=1+1'
 
 

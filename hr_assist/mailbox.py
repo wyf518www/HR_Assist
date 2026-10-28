@@ -93,4 +93,4 @@ class Inbox:
             for part in message.iter_attachments():
                 filename=part.get_filename() or "未命名附件"
                 attachments.append((filename,part.get_payload(decode=True) or b""))
-            yield {"uid":identifier.decode(),"received_at":received.isoformat(),"message_id":str(header.get("Message-ID","")),"attachments":attachments}
+            yield {"uid":identifier.decode(),"received_at":received.isoformat(),"message_id":str(header.get("Message-ID","")),"subject":str(message.get('Subject','')),"attachments":attachments}

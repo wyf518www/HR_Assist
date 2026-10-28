@@ -1,0 +1,109 @@
+HR Assist — Windows 一键更新工具
+
+一、第一次使用
+
+1. 将整个 ZIP 解压到 Windows 的一个固定文件夹。不要在压缩软件中直接运行。
+2. 双击 Update-HRAssist.cmd。
+3. 按提示填写下面四项：
+   NAS SSH host：Windows 能访问的 NAS 域名、IP 或已有 SSH 别名。不要带 https://。
+   SSH port：实际 SSH 端口；如经过路由器映射，填写外网映射端口，不是工作台 HTTPS 端口。
+   SSH username：你平时通过 SSH 登录群晖的管理员用户名。
+   Existing NAS project directory：已部署 HR Assist、包含 docker-compose.yml 的群晖绝对目录。
+4. Local folder containing cumulative packages：直接回车，使用本工具旁边的 updates 文件夹。
+5. 检查显示的更新包、目标主机和项目目录。暂停操作工作台，确认当前简历/JD任务完成，然后输入 y。
+6. 由 SSH 提示输入密码。输入时不显示字符，也不显示星号，这是正常的。
+   上传和执行是两次连接，可能分别询问密码；非 root 账号还可能收到 sudo 密码提示。
+   第一次连接可能要求确认主机指纹，核对后再接受；工具不会跳过主机校验。
+
+连接信息仅保存在解压目录的 .local-deployment/remote-update.json。
+不保存密码、API 密钥或邮箱授权码。无需把密码提供给他人。
+前提：Windows 已能连接群晖 SSH，账号具备执行 Docker 和 sudo 的权限。
+工具使用 Windows 自带的 ssh、scp 和 tar；缺少时会显示错误，不会自行安装软件。
+上传明确使用传统 SCP 协议（scp -O，字母大写 O），通过 SSH 传输，不依赖群晖的 SFTP 子系统。
+适用于本次使用的新版 Windows OpenSSH；群晖 SSH 登录环境需能执行 scp。
+提权后自动定位 Docker：先检查进程 PATH，再检查群晖 Container Manager / Docker 套件的常见目录。
+后续使用找到的绝对路径；只补齐本次脚本的 PATH，不修改系统环境配置。
+同时检查 Compose 和 Docker 引擎；支持 Compose 插件及可验证为 v2 的独立程序。
+此工具不修改路由器、SSH、反向代理、HTTPS 或系统防火墙设置。
+
+二、以后更新
+
+1. 把新的、可信的 HR Assist 累计更新包（hr-assist-*.tar.gz）放进 updates 文件夹，无需解压。
+2. 建议 updates 中仅保留本次要使用的包；旧包移到其他文件夹。
+   存在多个包时，脚本按本地文件修改时间选最新一个，并显示名称供确认；不联网查询版本。
+3. 双击 Update-HRAssist.cmd，确认目标和包名，输入 y，再按 SSH 提示输入密码。
+4. 等待 UPDATE SUCCESS 和 Container is healthy。
+   核对 RUNNING_VERSION 与所用更新包配套说明中的版本一致。
+5. 浏览器按 Ctrl+F5 刷新工作台，检查候选人、岗位及运行记录。
+
+仓库提供更新工具源码；累计更新包需另行取得并放入 updates 文件夹。包名、版本和变更内容以该包配套说明为准。
+不需要先安装之前的更新包，也不需要手工执行更新包内部 UPDATE.txt 中的部署命令。
+工具不会触发新的简历评估或重评；需要继续处理失败记录时，在工作台中手动执行。
+
+三、脚本执行内容
+
+上传更新包 → 校验完整性、实际挂载与任务状态 → 从正在运行的旧镜像构建候选镜像
+→ 离线导入检查 → 停服务 → 完整备份 → 启动新版本 → 检查健康状态 → 同步项目源码。
+
+不访问 GitHub，不执行 git pull/commit/push，不下载 apt 或 pip 依赖，不拉取新基础镜像。
+从 Docker 实际挂载获取 state/data 路径，核对它们与现有 Compose 配置一致。
+备份包括数据库、加密密钥、简历/JD/报告、管理员密码文件、项目配置及旧源码。
+.env、Compose 配置和业务数据不会被更新包覆盖。启动时可能执行新版本自带的数据库迁移。
+候选人人工跟进内容不由更新脚本改写。
+
+新镜像构建期间旧服务继续运行；停服务后才执行一致性备份。
+数据较多时，备份会延长停机时间，请保持 Windows 开机及 SSH 连接。
+如果检测到简历任务、JD 导入任务或另一个更新正在运行，会停止更新；等待完成后再试。
+
+四、备份与异常
+
+若旧工具上传时报“subsystem request failed on channel 0”，表示 SFTP 子系统请求被拒绝。
+该阶段尚未执行远程 Docker 更新。替换修正版 scripts/deploy/Update-HRAssist.ps1 后重试即可，
+现有 .local-deployment/remote-update.json 和 updates 中的更新包继续使用，无需重新填写配置。
+本修正版强制使用传统 SCP；如果之后提示远端 scp 不存在，先核对群晖 SSH 登录环境。
+
+若旧工具提权后提示“docker: command not found”，说明 sudo 的执行环境找不到 Docker。
+使用群晖路径兼容补丁替换 scripts/deploy/update_remote.sh 后重试，继续使用原有连接配置和更新包。
+修正版会先显示 Docker CLI 和 Compose command 的实际路径，并验证引擎连接。
+找不到 Docker、找不到 Compose v2 或无法访问引擎时，会在创建更新锁、构建和停服务之前退出。
+
+每次更新目录：群晖项目目录/.hr-assist-updates/时间编号/
+其中 backup/ 保存备份，status 记录 SUCCESS 或 FAILED，old-image-tag 记录旧镜像标签。
+source-before/ 保存更新前的源码。NAS 中的备份目录仅供管理员读取。
+旧镜像及备份自动保留，不自动清理；请在验收后根据磁盘空间自行管理。
+
+构建或校验失败：不停止旧服务。
+停服务后的备份失败：请求重新启动原容器，未开始新版本迁移。
+新版本启动后健康检查失败：停止新服务并保留当前数据及更新前备份，不自动回写数据库。
+如果终端提示停止/恢复启动失败，应先查看容器状态。
+若 SSH 中断或脚本报错，先查看该次 status 和容器状态，不要盲目删除 .hr-assist-update.lock。
+仅在确认没有更新仍在执行后，才处理遗留锁目录。
+
+不要在新版本已经启动后只切回旧镜像；数据库可能已经迁移。
+需要回退时，先额外保留更新后的 state/data，再结合本次备份恢复成套的数据、配置、源码和旧镜像。
+完整恢复会回到备份时点，必须核对更新后是否产生新记录。脚本不会自动做这一覆盖操作。
+
+五、可选命令（在解压目录打开 PowerShell）
+
+仅填写/修改连接配置，不连接群晖：
+  .\Update-HRAssist.cmd -Configure
+
+查看计划，不连接群晖；需要先有连接配置：
+  .\Update-HRAssist.cmd -Plan
+
+明确指定更新包：
+  .\Update-HRAssist.cmd -Package "D:\下载\hr-assist-example.tar.gz"
+
+使用其他本地配置文件：
+  .\Update-HRAssist.cmd -Config "D:\本地配置\remote-update.json"
+
+跳过启动前的 y/N 确认（仍需 SSH 密码）：
+  .\Update-HRAssist.cmd -Yes
+
+配置中的 Service / Image 默认为 hr-assist / hr-assist:0.1.0。
+如果你的实际部署曾修改服务名或镜像标签，请同步修改本地 JSON 后再使用。
+支持目前的绑定目录挂载方式；不会擅自转换 Docker 命名卷或改动 /app 源码挂载。
+
+适用边界：已有正常运行的 HR Assist 容器，更新包仅包含应用文件，不新增系统/Python依赖。
+需要新增依赖或改动部署结构的版本，应使用该版本配套的部署方案。
+本工具通过本地合成数据、PowerShell 计划模式及模拟 Docker 故障测试；尚未连接你的真实群晖验证。

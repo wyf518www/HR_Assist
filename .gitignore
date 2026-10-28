@@ -23,3 +23,13 @@ dist/
 .DS_Store
 secrets/
 storage/
+# Local deployment notes may contain private infrastructure details.
+/.local-deployment/
+/.hr-assist-updates/
+/.hr-assist-update.lock/
+/.hr-assist-source-*/
+# Generated delivery files are kept locally, separate from reusable source.
+/updates/
+/SHA256SUMS
+/使用说明.txt
+/本次更新说明.txt

@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS roles(
  id TEXT PRIMARY KEY,name TEXT UNIQUE NOT NULL,is_sales INTEGER NOT NULL,
- current_version TEXT,created_at TEXT NOT NULL);
+ current_version TEXT,created_at TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS jd_versions(
  id TEXT PRIMARY KEY,role_id TEXT NOT NULL REFERENCES roles(id),text TEXT NOT NULL,
  fields TEXT NOT NULL,criteria TEXT NOT NULL,approved INTEGER NOT NULL,missing TEXT NOT NULL,
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS applications(
  id TEXT PRIMARY KEY,file_id TEXT NOT NULL REFERENCES files(id),role_id TEXT REFERENCES roles(id),
  name TEXT NOT NULL,original_name TEXT NOT NULL,status TEXT NOT NULL,assessment_id TEXT,
  recommended_at TEXT,created_at TEXT NOT NULL);
-CREATE UNIQUE INDEX IF NOT EXISTS application_role ON applications(file_id,ifnull(role_id,''));
+CREATE UNIQUE INDEX IF NOT EXISTS application_role ON applications(file_id,role_id) WHERE role_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS assessments(
  id TEXT PRIMARY KEY,application_id TEXT NOT NULL REFERENCES applications(id),jd_version_id TEXT NOT NULL,
  cache_key TEXT NOT NULL UNIQUE,status TEXT NOT NULL,result TEXT NOT NULL,created_at TEXT NOT NULL);
@@ -67,6 +67,14 @@ CREATE TABLE IF NOT EXISTS events(
 CREATE TABLE IF NOT EXISTS notifications(
  id TEXT PRIMARY KEY,run_id TEXT,severity TEXT NOT NULL,message TEXT NOT NULL,
  read INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS jd_imports(
+ id TEXT PRIMARY KEY,file_id TEXT NOT NULL UNIQUE REFERENCES files(id),
+ status TEXT NOT NULL,text TEXT NOT NULL DEFAULT '',spans TEXT NOT NULL DEFAULT '[]',
+ draft TEXT NOT NULL DEFAULT '{}',metadata TEXT NOT NULL DEFAULT '{}',
+ error TEXT,error_code TEXT,attempts INTEGER NOT NULL DEFAULT 0,
+ role_id TEXT REFERENCES roles(id),version_id TEXT,
+ created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS jd_import_status ON jd_imports(status,created_at);
 """
 
 
@@ -77,6 +85,17 @@ class Database:
         with self.connect() as con:
             con.executescript(SCHEMA)
             con.execute("INSERT OR IGNORE INTO meta VALUES ('schema_version','1')")
+            con.execute("UPDATE meta SET value='2' WHERE key='schema_version' AND value='1'")
+            if 'active' not in {row['name'] for row in con.execute('PRAGMA table_info(roles)')}:
+                con.execute('ALTER TABLE roles ADD COLUMN active INTEGER NOT NULL DEFAULT 1')
+            con.execute("UPDATE meta SET value='3' WHERE key='schema_version' AND value='2'")
+            # Separate unresolved deliveries may share one PDF. Only a resolved
+            # (original, job) pair is unique; preserve all existing rows/history.
+            index=con.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='application_role'").fetchone()
+            if index and 'where role_id is not null' not in index['sql'].lower():
+                con.execute('DROP INDEX application_role')
+                con.execute('CREATE UNIQUE INDEX application_role ON applications(file_id,role_id) WHERE role_id IS NOT NULL')
+            con.execute("UPDATE meta SET value='4' WHERE key='schema_version' AND value='3'")
 
     @contextmanager
     def connect(self, write=False):

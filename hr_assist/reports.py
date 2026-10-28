@@ -6,17 +6,43 @@ import json
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
 from .db import dump, now, uid
 from .storage import BusinessError, validate_zip
 
-MANUAL_COLUMNS=["推荐给部门日期","面试日期","简历是否通过用人部门筛选","面试评价","当前状态"]
+LEGACY_MANUAL_COLUMNS=["推荐给部门日期","面试日期","简历是否通过用人部门筛选","面试评价","当前状态"]
+# Keep the original five storage positions, including free-text notes and formulas.
+MANUAL_COLUMNS=["推荐给用人部门日期","约面时间","用人部门复筛结果","面试评价","当前状态","面试状态","面试结果"]
+MANUAL_CHOICES={"用人部门复筛结果":("通过","不通过"),"面试状态":("待面试","已面","拒绝面试"),"面试结果":("通过","待定","未通过")}
 OVERVIEW_COLUMNS=["岗位名称","推荐日期","姓名","匹配度","推荐等级","当前公司","年限","核心优势","主要风险","建议",*MANUAL_COLUMNS]
 FOLLOWUP_COLUMNS=["记录ID","岗位名称","姓名",*MANUAL_COLUMNS]
 
 
 def empty_cells():
     return [{"value":None,"type":"n","format":"General"} for _ in MANUAL_COLUMNS]
+
+
+def normalized_cells(cells):
+    return cells + empty_cells()[len(cells):]
+
+
+def validate_manual_cell(column, cell):
+    value=cell_value(cell)
+    if value is None or value == '':
+        return
+    if column in MANUAL_CHOICES and value not in MANUAL_CHOICES[column]:
+        raise BusinessError('FOLLOWUP_VALUE', column+'只能填写：'+' / '.join(MANUAL_CHOICES[column])+'，也可留空。')
+    if column in {'推荐给用人部门日期','约面时间'}:
+        try:
+            if cell['type']=='f' or not isinstance(value,(str,date,datetime)):
+                raise ValueError()
+            parsed=datetime.fromisoformat(value) if isinstance(value,str) else value
+            if isinstance(parsed,datetime) and parsed.tzinfo is not None:
+                raise ValueError()
+        except ValueError as exc:
+            raise BusinessError('FOLLOWUP_DATE', column+'请填写有效日期或北京时间（YYYY-MM-DD HH:MM），也可留空。') from exc
 
 
 def serialize_cell(cell):
@@ -70,19 +96,104 @@ def style_sheet(sheet, manual_start):
             cell.alignment=Alignment(vertical="top",wrap_text=True)
 
 
-def applications(db):
-    rows=db.all("""SELECT a.*,r.name role_name,r.is_sales,s.result assessment_result,f.cells,f.revision
+def applications(db, *, identity=None, summary=False):
+    # Lists need a few score fields, not every evidence quotation. Project in
+    # SQLite so the full result never crosses into the response-building loop.
+    result=("""CASE WHEN s.result IS NULL OR json_type(s.result)='null' THEN NULL
+        WHEN json(s.result)='{}' THEN '{}'
+        ELSE json_object('score',json_extract(s.result,'$.score'),
+                         'grade',json_extract(s.result,'$.grade'),
+                         'provisional',json_extract(s.result,'$.provisional')) END"""
+        if summary else "s.result")
+    where=" WHERE a.id=?" if identity is not None else ""
+    rows=db.all(f"""SELECT a.*,r.name role_name,r.is_sales,{result} assessment_result,f.cells,f.revision
     FROM applications a LEFT JOIN roles r ON a.role_id=r.id
     LEFT JOIN assessments s ON a.assessment_id=s.id
-    LEFT JOIN followups f ON f.application_id=a.id ORDER BY a.created_at DESC,a.id""")
+    LEFT JOIN followups f ON f.application_id=a.id{where} ORDER BY a.created_at DESC,a.id""",
+    (identity,) if identity is not None else ())
     for row in rows:
         row["assessment"]=json.loads(row.pop("assessment_result") or "null")
-        row["manual_cells"]=json.loads(row.pop("cells") or dump(empty_cells()))
+        if summary and row['assessment']:
+            row['assessment']['provisional']=bool(row['assessment']['provisional'])
+        row["manual_cells"]=normalized_cells(json.loads(row.pop("cells") or dump(empty_cells())))
         row["manual"]=dict(zip(MANUAL_COLUMNS,[display_cell(c) for c in row["manual_cells"]]))
     # Stable within date and role. ISO UTC date corresponds to stored local recommendation date.
     rows.sort(key=lambda x:(x["role_name"] or "待分类",x["id"]))
     rows.sort(key=lambda x:x["recommended_at"] or "",reverse=True)
     return rows
+
+
+def application_counts(db):
+    """Aggregate the overview without loading candidate evidence or feedback."""
+    grades=("强烈推荐","推荐","待定","不推荐")
+    grade_columns=','.join(f"coalesce(sum(json_extract(s.result,'$.grade')=?),0) grade_{i}" for i in range(len(grades)))
+    row=db.one(f"""SELECT count(*) applications,
+        coalesce(sum(CASE WHEN s.result IS NULL OR json_type(s.result)='null'
+                         OR json(s.result)='{{}}' THEN 1 ELSE 0 END),0) pending,
+        {grade_columns}
+        FROM applications a LEFT JOIN assessments s ON a.assessment_id=s.id""",grades)
+    return {'applications':row['applications'],'pending':row['pending'],
+            'grades':{grade:row[f'grade_{i}'] for i,grade in enumerate(grades)}}
+
+
+def save_followup(db, identity, data):
+    with db.connect(True) as con:
+        row=con.execute('SELECT cells,revision FROM followups WHERE application_id=?',(identity,)).fetchone()
+        if not row:
+            raise BusinessError('APPLICATION_NOT_FOUND','申请记录不存在。',404)
+        if row['revision']!=data.expected_revision:
+            raise BusinessError('FEEDBACK_CONFLICT','这条人工跟进已被其他页面或 Excel 修改，本次未保存。请刷新并核对最新内容。',409)
+        cells=normalized_cells(json.loads(row['cells']))
+        changed=False
+        for column,value in data.changes.items():
+            index=MANUAL_COLUMNS.index(column)
+            cell={'value':value or None,'type':'s' if value else 'n','format':'General'}
+            validate_manual_cell(column,cell)
+            if display_cell(cells[index]) != (value or None):
+                cells[index]=cell
+                changed=True
+        if changed:
+            con.execute('UPDATE followups SET cells=?,revision=revision+1,updated_at=? WHERE application_id=?',
+                        (dump(cells),now(),identity))
+    if changed:
+        db.event('FOLLOWUP_SAVED','人工跟进字段已保存。',application_id=identity)
+    return {'ok':True,'revision':row['revision']+int(changed)}
+
+
+def save_followup_batch(db, data):
+    # A patch is explicit: omitted columns are never inspected or rewritten,
+    # including historical free-text values, formulas and cell formatting.
+    patch={}
+    for column,value in data.fields.items():
+        cell={'value':value or None,'type':'s' if value else 'n','format':'General'}
+        validate_manual_cell(column,cell)
+        patch[MANUAL_COLUMNS.index(column)]=cell
+    changed_rows={}
+    revisions={}
+    with db.connect(True) as con:
+        for item in data.items:
+            row=con.execute('SELECT cells,revision FROM followups WHERE application_id=?',(item.application_id,)).fetchone()
+            if row is None:
+                raise BusinessError('APPLICATION_NOT_FOUND','部分申请记录不存在，本次全部未保存，请刷新候选人列表。',404)
+            if row['revision']!=item.expected_revision:
+                raise BusinessError('FEEDBACK_CONFLICT','所选记录的人工跟进已被其他页面或 Excel 修改，本次全部未保存。请刷新并核对最新内容。',409)
+            cells=normalized_cells(json.loads(row['cells']))
+            changed=False
+            for index,cell in patch.items():
+                if display_cell(cells[index])!=cell['value']:
+                    cells[index]=cell
+                    changed=True
+            revisions[item.application_id]=row['revision']+int(changed)
+            if changed:
+                changed_rows[item.application_id]=cells
+        # Validate every selected revision before the first write.
+        timestamp=now()
+        for identity,cells in changed_rows.items():
+            con.execute('UPDATE followups SET cells=?,revision=revision+1,updated_at=? WHERE application_id=?',
+                        (dump(cells),timestamp,identity))
+    if changed_rows:
+        db.event('FOLLOWUP_BATCH_SAVED',f'人工跟进批量保存：选中 {len(data.items)} 条，更新 {len(changed_rows)} 条。')
+    return {'ok':True,'selected_rows':len(data.items),'updated_rows':len(changed_rows),'revisions':revisions}
 
 
 def followup_export(db, storage):
@@ -100,11 +211,19 @@ def followup_export(db, storage):
             write_manual(sheet.cell(row_index,column),cell)
         snapshot[row["id"]]=row["manual_cells"]
     metadata=book.create_sheet("_metadata")
-    metadata.append(["template","HR_ASSIST_FOLLOWUP_V1"])
+    metadata.append(["template","HR_ASSIST_FOLLOWUP_V2"])
     metadata.append(["export_id",export_id])
     metadata.sheet_state="veryHidden"
     style_sheet(sheet,4)
     sheet.column_dimensions["A"].width=36
+    for name,choices in MANUAL_CHOICES.items():
+        column=get_column_letter(4+MANUAL_COLUMNS.index(name))
+        validation=DataValidation(type='list',formula1='"'+','.join(choices)+'"',allow_blank=True)
+        validation.showErrorMessage=True
+        validation.errorTitle='请选择有效选项'
+        validation.error='请从下拉列表选择，也可留空。'
+        sheet.add_data_validation(validation)
+        validation.add(f'{column}2:{column}{max(2,len(rows)+1)}')
     buffer=BytesIO();book.save(buffer)
     file=storage.put(buffer.getvalue(),"人工跟进.xlsx","followup")
     db.execute("INSERT INTO workbook_exports VALUES (?,?,?,?)",(export_id,dump(snapshot),file["id"],now()))
@@ -116,16 +235,18 @@ def followup_import(db, storage, data, filename):
     try:
         book=load_workbook(BytesIO(data),data_only=False,keep_links=False)
         meta=book["_metadata"]
-        if meta["B1"].value!="HR_ASSIST_FOLLOWUP_V1":
+        template=meta["B1"].value
+        if template not in {"HR_ASSIST_FOLLOWUP_V1","HR_ASSIST_FOLLOWUP_V2"}:
             raise ValueError()
+        columns=FOLLOWUP_COLUMNS if template=='HR_ASSIST_FOLLOWUP_V2' else ['记录ID','岗位名称','姓名',*LEGACY_MANUAL_COLUMNS]
         export_id=meta["B2"].value
         source=db.one("SELECT * FROM workbook_exports WHERE id=?",(export_id,))
         if not source:
             raise BusinessError("UNKNOWN_EXPORT","此文件不是当前工作台导出的人工跟进表。")
         sheet=book["人工跟进"]
-        if sheet.max_row>20_001 or sheet.max_column!=len(FOLLOWUP_COLUMNS):
+        if sheet.max_row>20_001 or sheet.max_column!=len(columns):
             raise ValueError()
-        if [cell.value for cell in sheet[1]]!=FOLLOWUP_COLUMNS:
+        if [cell.value for cell in sheet[1]]!=columns:
             raise ValueError()
         baseline=json.loads(source["snapshot"])
         incoming={}
@@ -135,7 +256,7 @@ def followup_import(db, storage, data, filename):
                 continue
             if identity not in baseline or identity in incoming:
                 raise BusinessError("ROW_ID_INVALID","记录 ID 被改写、重复或来自其他导出。请重新下载模板。")
-            incoming[identity]=[serialize_cell(c) for c in row[3:8]]
+            incoming[identity]=[serialize_cell(c) for c in row[3:len(columns)]]
     except BusinessError:
         raise
     except Exception as exc:
@@ -147,11 +268,13 @@ def followup_import(db, storage, data, filename):
             current_row=con.execute("SELECT cells,revision FROM followups WHERE application_id=?",(identity,)).fetchone()
             if not current_row:
                 raise BusinessError("ROW_REMOVED","申请记录已不存在，无法合并。",409)
-            current=json.loads(current_row["cells"])
+            current=normalized_cells(json.loads(current_row["cells"]))
             merged=copy(current)
             for i,cell in enumerate(cells):
-                before=baseline[identity][i]
+                before=normalized_cells(baseline[identity])[i]
                 if cell!=before:
+                    if template=='HR_ASSIST_FOLLOWUP_V2':
+                        validate_manual_cell(MANUAL_COLUMNS[i],cell)
                     if current[i]!=before and current[i]!=cell:
                         conflicts.append({"application_id":identity,"column":MANUAL_COLUMNS[i]})
                     else:
@@ -159,7 +282,7 @@ def followup_import(db, storage, data, filename):
             if merged!=current:
                 changes[identity]=(merged,current_row["revision"]+1)
         if conflicts:
-            raise BusinessError("FEEDBACK_CONFLICT",f"发现 {len(conflicts)} 个字段与后来上传的反馈冲突。本次未写入，请重新下载最新表后合并。",409)
+            raise BusinessError("FEEDBACK_CONFLICT",f"发现 {len(conflicts)} 个字段与后来保存的反馈冲突。本次未写入，请重新下载最新表后合并。",409)
         for identity,(cells,revision) in changes.items():
             con.execute("UPDATE followups SET cells=?,revision=?,updated_at=? WHERE application_id=?",(dump(cells),revision,now(),identity))
         # Original upload is immutable. Transactions cover feedback updates and the import record.
@@ -195,7 +318,7 @@ def overview_export(db, storage):
         values=[row["role_name"] or "待分类",row["recommended_at"] or "",row["name"],result.get("score"),result.get("grade",""),
                 facts.get("company",""),facts.get("experience",""),"；".join(result.get("advantages",[])),
                 "；".join(result.get("risks",[])) or ("JD缺失项：岗位要求未补齐或尚未确认，停止评估" if row["status"]=="WAITING_JD" else row["status"] if not result else result.get("gate_reason","")),
-                ("暂计分；存在未知信息，请人工核验。\n" if result.get("provisional") else "")+("\n".join(refs) or "尚未评估，请在工作台处理待办。")]
+                ("暂计分；存在未知信息，请人工核验。\n" if result.get("provisional") else "")+("\n".join(refs) or ("请查看逐项要求与待核验信息。" if result else "尚未评估，请在工作台处理待办。"))]
         for column,value in enumerate(values,1):
             if column==4:
                 sheet.cell(index,column,value)
@@ -203,8 +326,8 @@ def overview_export(db, storage):
                 text_cell(sheet.cell(index,column),value)
         for column,cell in enumerate(row["manual_cells"],11):
             write_manual(sheet.cell(index,column),cell)
-        text_cell(sheet.cell(index,16),row["id"])
-    sheet.column_dimensions["P"].hidden=True
+        text_cell(sheet.cell(index,len(OVERVIEW_COLUMNS)+1),row["id"])
+    sheet.column_dimensions[get_column_letter(len(OVERVIEW_COLUMNS)+1)].hidden=True
     style_sheet(sheet,11)
     evidence=book.create_sheet("评估证据")
     evidence.append(["记录ID","岗位","JD版本","维度","要求","判定","得分","简历位置","简历引文","JD依据来源"])
@@ -212,7 +335,8 @@ def overview_export(db, storage):
         result=row["assessment"] or {}
         span_map={s["id"]:s for s in result.get("evidence_spans",[])}
         for item in result.get("items",[]):
-            for ref in item["evidence"] or [{"span_id":"","quote":"无证据，待核验"}]:
+            empty_quote="已确认JD明确不作要求，无须简历证据" if item["verdict"]=="met" and item.get("hard") else "无证据，待核验"
+            for ref in item["evidence"] or [{"span_id":"","quote":empty_quote}]:
                 span=span_map.get(ref["span_id"],{})
                 values=[row["id"],row["role_name"],result.get("jd_version_id",""),item["dimension"],item["description"],item["verdict"],item["awarded"],
                         f"{ref['span_id']} / 第 {span.get('page') or '—'} 页",ref["quote"],"已确认 JD 结构化要求" if item["source"]=="jd" else "用户确认的全局评分规则"]
@@ -239,8 +363,10 @@ def role_reports(db, storage, run_id):
             items=[]
             for item in result["items"]:
                 quotes="<br>".join(escape(f"{e['span_id']}：{e['quote']}") for e in item["evidence"])
-                items.append(f"<tr><td>{escape(item['description'])}</td><td>{item['awarded']}/{item['points']}</td><td>{escape(item['reason'])}<br>{quotes}</td></tr>")
-            sections.append(f"<section><h2>{escape(row['name'])} · {result['score']}/100 · {escape(result['grade'])}</h2><p>{escape(result['gate_reason'])}</p><p>记录 {row['id']} / JD {escape(result.get('jd_version_id',''))}</p><table><tr><th>要求</th><th>分数</th><th>依据</th></tr>{''.join(items)}</table></section>")
+                verdict={"met":"满足","partial":"部分满足","not_met":"不满足","unknown":"未知，待核验"}[item["verdict"]]
+                items.append(f"<tr><td>{escape(item['description'])}</td><td>{verdict}</td><td>{item['awarded']}/{item['points']}</td><td>{escape(item['reason'])}<br>{quotes}</td></tr>")
+            provisional="<p><b>暂计分；存在未知信息，请人工核验。缺少证据不等于不满足要求。</b></p>" if result.get("provisional") else ""
+            sections.append(f"<section><h2>{escape(row['name'])} · {result['score']}/100 · {escape(result['grade'])}</h2>{provisional}<p>{escape(result['gate_reason'])}</p><p>记录 {row['id']} / JD {escape(result.get('jd_version_id',''))}</p><table><tr><th>要求</th><th>判定</th><th>分数</th><th>依据</th></tr>{''.join(items)}</table></section>")
         document=f"<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>{escape(role)}推荐报告</title><style>body{{max-width:1100px;margin:40px auto;padding:20px;font:15px/1.8 sans-serif;color:#183443}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccd7dc;padding:12px;text-align:left}}section{{margin-top:35px}}</style><h1>{escape(role)}推荐报告</h1><p>生成时间：{now()} / 批次：{run_id}。建议供人工核验，不自动淘汰或录用。</p>{''.join(sections)}</html>"
         files.append(storage.put(document.encode(),f"{role}_推荐报告.html","reports"))
     return files

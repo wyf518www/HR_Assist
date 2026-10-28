@@ -6,7 +6,7 @@ import json
 import secrets
 import time
 
-from fastapi import Depends, FastAPI, File, Form, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,8 +14,8 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__
 from .config import Environment
 from .db import now, uid
-from .reports import MANUAL_COLUMNS, applications, followup_export, followup_import, overview_export
-from .schemas import ClassifyInput, DocumentReview, Login, RoleInput, RunInput, SettingsInput
+from .reports import MANUAL_COLUMNS, application_counts, applications, followup_export, followup_import, overview_export, save_followup, save_followup_batch
+from .schemas import CandidateNameReview, ClassifyInput, DocumentReview, FollowupInput, FollowupBatchInput, IdentityCorrections, JDImportConfirm, JDTextAnalysis, Login, RoleAction, RoleInput, RoleStatusInput, RunInput, SettingsInput
 from .security import LoginLimiter, password_matches, token_hash
 from .service import Service
 from .middleware import BodyLimit
@@ -49,6 +49,7 @@ def create_app(environment=None):
 
     @app.exception_handler(Exception)
     async def unexpected_error(request,error):
+        service.diagnostics.failure('internal',error)
         service.db.event("HTTP_ERROR","请求处理出现内部错误；异常内容未写入日志。",level="error")
         return JSONResponse({"error":{"code":"INTERNAL_ERROR","message":"请求处理失败，请稍后重试或查看运行记录。"}},status_code=500)
 
@@ -124,12 +125,12 @@ def create_app(environment=None):
 
     @app.get("/api/dashboard",dependencies=[Depends(auth)])
     def dashboard():
-        rows=applications(service.db)
-        graded={grade:sum(bool(a["assessment"]) and a["assessment"]["grade"]==grade for a in rows) for grade in ("强烈推荐","推荐","待定","不推荐")}
+        counts=application_counts(service.db)
+        counts['roles']=service.db.one('SELECT count(*) total FROM roles')['total']
         latest=service.db.one("SELECT * FROM runs ORDER BY started_at DESC LIMIT 1")
         if latest:
             latest["stats"]=json.loads(latest["stats"])
-        return {"counts":{"applications":len(rows),"pending":sum(not r["assessment"] for r in rows),"roles":len(service.roles()),"grades":graded},
+        return {"counts":counts,
                 "latest_run":latest,"preflight":service.preflight(mail=True),"schedule":service.settings()["schedule"],
                 "notifications":service.db.all("SELECT * FROM notifications ORDER BY created_at DESC LIMIT 20")}
 
@@ -148,8 +149,15 @@ def create_app(environment=None):
         return service.preflight(mail=True)
 
     @app.get("/api/roles",dependencies=[Depends(auth)])
-    def roles():
-        return service.roles()
+    def roles(summary:bool=False):
+        return service.roles(summary=summary)
+
+    @app.get("/api/roles/{identity}",dependencies=[Depends(auth)])
+    def get_role(identity:str):
+        rows=service.roles(identity=identity)
+        if not rows:
+            raise BusinessError('ROLE_NOT_FOUND','岗位不存在或已被删除。',404)
+        return rows[0]
 
     @app.post("/api/roles",dependencies=[Depends(auth)])
     def create_role(data:RoleInput):
@@ -167,13 +175,59 @@ def create_app(environment=None):
         data=await read_upload(file)
         return await run_in_threadpool(service.upload_jd,data,file.filename or "jd.pdf")
 
+    @app.delete("/api/roles/{identity}",dependencies=[Depends(auth)])
+    def delete_role(identity:str,data:RoleAction):
+        return service.change_role(identity,data,delete=True)
+
+    @app.post("/api/roles/{identity}/status",dependencies=[Depends(auth)])
+    def set_role_status(identity:str,data:RoleStatusInput):
+        return service.change_role(identity,data)
+
     @app.get("/api/applications",dependencies=[Depends(auth)])
-    def list_applications():
-        return applications(service.db)
+    def list_applications(summary:bool=False):
+        return applications(service.db,summary=summary)
+
+    @app.post("/api/jd/imports",dependencies=[Depends(auth)],status_code=202)
+    async def import_jd(file:UploadFile=File(...)):
+        from starlette.concurrency import run_in_threadpool
+        data=await read_upload(file)
+        return await run_in_threadpool(service.jd_imports.enqueue,data,file.filename or "jd.pdf")
+
+    @app.post("/api/jd/analyze-text",dependencies=[Depends(auth)])
+    def analyze_jd_text(data:JDTextAnalysis):
+        return service.jd_imports.analyze_text(data.text)
+
+    @app.get("/api/jd/imports",dependencies=[Depends(auth)])
+    def list_jd_imports():
+        return service.jd_imports.list()
+
+    @app.get("/api/jd/imports/{identity}",dependencies=[Depends(auth)])
+    def get_jd_import(identity:str):
+        return service.jd_imports.get(identity)
+
+    @app.post("/api/jd/imports/{identity}/retry",dependencies=[Depends(auth)])
+    def retry_jd_import(identity:str):
+        return service.jd_imports.retry(identity)
+
+    @app.post("/api/jd/imports/{identity}/confirm",dependencies=[Depends(auth)])
+    def confirm_jd_import(identity:str,data:JDImportConfirm):
+        return service.jd_imports.confirm(identity,data)
+
+    @app.put('/api/applications/followup-batch',dependencies=[Depends(auth)])
+    def update_followup_batch(data:FollowupBatchInput):
+        return save_followup_batch(service.db,data)
 
     @app.get("/api/applications/{identity}",dependencies=[Depends(auth)])
     def get_application(identity:str):
         return service.get_application(identity)
+
+    @app.get('/api/identities',dependencies=[Depends(auth)])
+    def identity_proposals():
+        return service.identities.review_rows()
+
+    @app.post('/api/identities/apply',dependencies=[Depends(auth)])
+    def identity_apply(data:IdentityCorrections):
+        return service.identities.apply([i.model_dump() for i in data.items])
 
     @app.post("/api/resumes",dependencies=[Depends(auth)])
     async def upload_resume(file:UploadFile=File(...),role_id:str=Form(default="")):
@@ -186,9 +240,12 @@ def create_app(environment=None):
 
     @app.post("/api/applications/{identity}/reassess",dependencies=[Depends(auth)])
     def reassess(identity:str):
-        service.get_application(identity)
+        application=service.get_application(identity)
         if service.run_lock.locked():
             raise BusinessError("RUN_BUSY","已有任务运行中。",409)
+        role=service.db.one("SELECT active FROM roles WHERE id=?",(application['role_id'],))
+        if role and not role['active']:
+            raise BusinessError("ROLE_INACTIVE","岗位已停用，请先启用岗位再申请重新评估。",409)
         service.db.execute("UPDATE applications SET assessment_id=NULL,status='QUEUED' WHERE id=?",(identity,))
         service.db.event("REASSESS_REQUESTED","已申请重新评估，历史结果和人工反馈保留。",application_id=identity)
         return {"ok":True}
@@ -198,9 +255,17 @@ def create_app(environment=None):
         service.verify_document(identity,data.text,data.note)
         return {"ok":True}
 
+    @app.post("/api/applications/{identity}/verify-name",dependencies=[Depends(auth)])
+    def verify_name(identity:str,data:CandidateNameReview):
+        return service.review_candidate_name(identity,data)
+
+    @app.put("/api/applications/{identity}/followup",dependencies=[Depends(auth)])
+    def update_followup(identity:str,data:FollowupInput):
+        return save_followup(service.db,identity,data)
+
     @app.post("/api/runs",dependencies=[Depends(auth)])
     def start_run(data:RunInput):
-        return service.start_run(data.mode,data.idempotency_key)
+        return service.start_run(data.mode,data.idempotency_key,application_ids=data.application_ids,force_identity=data.force_identity)
 
     @app.get("/api/runs",dependencies=[Depends(auth)])
     def runs():
@@ -212,6 +277,21 @@ def create_app(environment=None):
     @app.get("/api/events",dependencies=[Depends(auth)])
     def events():
         return service.db.all("SELECT * FROM events ORDER BY created_at DESC LIMIT 200")
+
+    @app.get("/api/diagnostics",dependencies=[Depends(auth)])
+    def diagnostic_status():
+        return service.diagnostics.status()
+
+    @app.get("/api/diagnostics/records",dependencies=[Depends(auth)])
+    def diagnostic_records(day:str,run_id:str|None=None,limit:int=Query(default=200,ge=1,le=1000)):
+        return service.diagnostics.read(day,limit=limit,run_id=run_id)
+
+    @app.get("/api/diagnostics/download",dependencies=[Depends(auth)])
+    def diagnostic_download(day:str,run_id:str|None=None):
+        data=service.diagnostics.export(day,run_id=run_id)
+        filename=f'diagnostic-{day}'+(f'-{run_id[:10]}' if run_id else '')+'.jsonl'
+        return Response(content=data,media_type='application/x-ndjson',
+                        headers={'Content-Disposition':f'attachment; filename="{filename}"'})
 
     @app.post("/api/notifications/{identity}/read",dependencies=[Depends(auth)])
     def notification_read(identity:str):

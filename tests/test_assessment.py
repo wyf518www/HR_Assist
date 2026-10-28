@@ -68,4 +68,4 @@ def test_cloud_contract_and_sanitized_errors(monkeypatch):
     def failure(request):return httpx.Response(401,text='upstream message test-secret')
     monkeypatch.setattr('hr_assist.assessment.httpx.Client',lambda **kwargs:client_class(transport=httpx.MockTransport(failure),**kwargs))
     with pytest.raises(BusinessError) as error:model.complete('system',{})
-    assert error.value.code=='MODEL_FAILED' and 'test-secret' not in error.value.message
+    assert error.value.code=='MODEL_AUTH' and 'test-secret' not in error.value.message

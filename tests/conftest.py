@@ -5,7 +5,7 @@ from pypdf.generic import NameObject, DictionaryObject, DecodedStreamObject
 
 from hr_assist.config import Environment
 from hr_assist.service import Service
-from hr_assist.schemas import RoleInput
+from hr_assist.schemas import RoleInput, CandidateNameReview
 
 
 @pytest.fixture
@@ -51,7 +51,11 @@ def pdf():
 
 @pytest.fixture
 def application(service,role,pdf):
-    return service.ingest(pdf,'【软件工程师_Test_测试】.pdf',role['id'])
+    app=service.ingest(pdf,'【软件工程师_Test_测试】.pdf',role['id'])
+    # This shared fixture represents a human-confirmed identity so assessment
+    # regressions test scoring independently of the new extraction call.
+    service.review_candidate_name(app['id'],CandidateNameReview(name='Test',expected_name='待识别',confirmed=True))
+    return app
 
 
 def run(service,mode='pending',key=None):
