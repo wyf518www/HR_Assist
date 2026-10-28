@@ -1,7 +1,7 @@
 'use strict';
 const batchFollowupFields=['推荐给用人部门日期','用人部门复筛结果','约面时间','面试状态','面试结果','面试评价','当前状态'];
 function batchFollowupToolbar(){
-  return `<div class="batch-followup-toolbar mb"><div class="actions">${btn('全选当前结果','batch-select-all')}${btn('取消选择','batch-select-none')}<span id="batch-selection-count" role="status">已选 0 人</span>${btn('批量跟进','batch-open',true,'disabled')}</div><p class="form-help">先勾选候选人，再统一填写跟进。筛选或刷新列表会清空选择，一次最多500人。</p></div>`;
+  return `<div class="batch-followup-toolbar mb"><div class="actions">${btn('全选本页','batch-select-all')}${btn('取消选择','batch-select-none')}<span id="batch-selection-count" role="status">已选 0 人</span>${btn('批量跟进','batch-open',true,'disabled')}</div><p class="form-help">选择仅限本页。筛选、排序、翻页或刷新会清空选择；每页最多500人，保存前会展示人员名单供确认。</p></div>`;
 }
 function updateFollowupSelection(){
   const count=document.querySelectorAll('[name=batch-candidate]:checked').length;

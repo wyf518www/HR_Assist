@@ -15,6 +15,7 @@
 - 公司批准的 JSON 对话模型接口做逐项证据判定，程序核验引文并计算 20/30/30/10/10 分值。缺证据显示暂计分、待定，JD 不完整则不评估。
 - 网页与“人工跟进.xlsx”共用七个人工跟进字段；Excel 按导出基准逐字段合并，冲突整批拒绝。生成“招聘推荐总览.xlsx”（17列 + 证据表）与岗位 HTML 报告。
 - 候选人库支持多选后批量跟进：只改勾选字段，先预览人员和覆盖内容再确认；支持明确清空，任一记录版本冲突则整批不写入。
+- 候选人库支持组合筛选姓名/岗位/附件名、岗位、处理状态、推荐等级、匹配度区间和面试跟进；可按匹配度、处理状态、推荐日期、入库时间或约面时间双向排序。未评估不等于0分，空值始终置底。每页50/100/200/500人，批量跟进只选择本页，筛选、排序和翻页会清空选择。
 - 人工反馈统计、可修改并版本化的评分细则、显式重评；不自动训练或调整规则。
 - 工作台内通知、任务记录、JSONL 审计日志、异常隔离和任务续跑。
 - 详细诊断记录处理阶段、耗时、错误码及技术元数据，不记录凭据或简历正文；默认保留7天，每天北京时间03:00清理，业务记录和审计日志保留。
@@ -50,7 +51,7 @@ $env:HR_SCHEDULER = 'false'
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
 node --check hr_assist/web/app.js
-node --test tests/test_page_navigation.js tests/test_model_settings.js
+node --test tests/test_page_navigation.js tests/test_model_settings.js tests/test_candidate_query.js tests/test_candidate_list.js
 ```
 
 CI 在 Linux 上运行测试、构建镜像，并验证容器登录、扫描 PDF OCR 和重启后数据保留。实际检查结果见 [第一版实施与验收](docs/第一版实施与验收.md)。
