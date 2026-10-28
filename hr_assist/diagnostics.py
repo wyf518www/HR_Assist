@@ -28,9 +28,9 @@ MAX_EXPORT_BYTES = 10 * 1024 * 1024
 MAX_RECORD_BYTES = 16 * 1024
 PHASES = frozenset({"preflight", "internal", "archive", "mail_fetch", "document_parse", "identity", "assessment", "report_export",
                     "jd_text", "jd_import", "identity_review"})
-EVENTS = frozenset({"PHASE_STARTED", "PHASE_COMPLETED", "PHASE_FAILED", "MODEL_REQUEST_STARTED",
+EVENTS = frozenset({"PHASE_STARTED", "PHASE_COMPLETED", "PHASE_FAILED", "PHASE_WAITING", "MODEL_REQUEST_STARTED",
                     "MODEL_HEADERS_RECEIVED", "MODEL_RESPONSE_RECEIVED", "MODEL_REQUEST_COMPLETED",
-                    "MODEL_REQUEST_FAILED"})
+                    "MODEL_REQUEST_FAILED", "SEMANTIC_DRAFT_REUSED"})
 ERROR_CODES = frozenset("""
 MODEL_NOT_CONFIGURED MODEL_FAILED MODEL_TIMEOUT MODEL_CONNECT MODEL_TRANSPORT MODEL_AUTH
 MODEL_FORBIDDEN MODEL_RATE_LIMIT MODEL_ENDPOINT MODEL_REQUEST MODEL_UNAVAILABLE MODEL_HTTP
@@ -48,6 +48,7 @@ NAME_CHANGED PREFLIGHT RESUME_FORMAT ROLE_ALREADY_ASSIGNED ROLE_DUPLICATE ROLE_I
 ROLE_INACTIVE ROLE_NOT_FOUND RUN_BUSY ENCRYPTED FILE_NOT_FOUND INVALID_OFFICE PATH_INVALID
 ZIP_LIMIT IDENTITY_SCHEMA IDENTITY_EVIDENCE_INVALID IDENTITY_FAILED INTERNAL_ERROR
 MODEL_BUDGET SHUTDOWN WAITING_CONFIG WAITING_INPUT IDENTITY_AMBIGUOUS IDENTITY_REVIEW_REQUIRED
+EVIDENCE_SOURCE_INVALID EDUCATION_CATALOG_INVALID
 """.split())
 EXCEPTION_TYPES = frozenset("""
 BusinessError ValueError TimeoutError ReadTimeout ConnectTimeout WriteTimeout PoolTimeout
@@ -64,6 +65,21 @@ first_byte_ms elapsed_ms read_timeout_seconds connect_timeout_seconds http_statu
 content_characters reasoning_characters prompt_tokens completion_tokens total_tokens reasoning_tokens
 cached_tokens input_tokens output_tokens attempt retry_count item_count candidate_count criterion_count
 """.split())
+# Only fixed classifications and bounded counts may leave a validation exception.
+# In particular, do not accept custom JD ids, fact values, quotes or span ids.
+REASON_ENUMS = {
+    "model_step": frozenset({"analysis", "review"}),
+    "validation_kind": frozenset({"score_evidence", "fact_evidence", "fact_value"}),
+    "evidence_reason": frozenset({"span_missing", "empty_quote", "no_match", "ambiguous_match", "value_missing"}),
+    "criterion_dimension": frozenset({"hard", "skills", "experience", "achievements", "stability"}),
+    "fact_field": frozenset({"company", "education_level", "admission", "institution", "experience"}),
+    "identity_reason": frozenset({"name_unresolved", "role_unresolved", "name_and_role_unresolved", "history_confirmation"}),
+}
+REASON_NUMBERS = {
+    "criterion_index": (1, 1000), "fact_index": (1, 1000), "evidence_index": (1, 1000),
+    "quote_characters": (0, 20000), "value_characters": (0, 20000),
+}
+REASON_FIELDS = frozenset(REASON_ENUMS) | frozenset(REASON_NUMBERS)
 _FILE = re.compile(r"^diagnostic-(\d{4}-\d{2}-\d{2})(?:\.(0[1-9]))?\.jsonl$")
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _UUID = re.compile(r"^[0-9a-f]{32}$")
@@ -97,7 +113,14 @@ def _timestamp(value):
 def _sanitize(fields):
     result = {}
     for key, value in fields.items():
-        if key in ID_FIELDS and isinstance(value, str) and _UUID.fullmatch(value):
+        if key in REASON_ENUMS:
+            if isinstance(value, str) and value in REASON_ENUMS[key]:
+                result[key] = value
+        elif key in REASON_NUMBERS:
+            low, high = REASON_NUMBERS[key]
+            if type(value) is int and low <= value <= high:
+                result[key] = value
+        elif key in ID_FIELDS and isinstance(value, str) and _UUID.fullmatch(value):
             result[key] = value
         elif key in NUMERIC_FIELDS and type(value) in (int, float):
             if 0 <= value <= 10**12 and (type(value) is int or math.isfinite(value)):
@@ -141,6 +164,11 @@ def _failure(exc):
     code = getattr(exc, "code", None)
     result = {"exception_type": exception_type if exception_type in EXCEPTION_TYPES else "OtherException",
               "error_code": code if isinstance(code, str) and code in ERROR_CODES else "INTERNAL_ERROR"}
+    details = getattr(exc, "diagnostics", None)
+    if isinstance(details, dict):
+        # Do not let even otherwise-valid metadata replace the actual failure or
+        # its bound run/application/trace identity.
+        result.update(_sanitize({key: value for key, value in details.items() if key in REASON_FIELDS}))
     frames, tb = [], exc.__traceback__
     while tb is not None:
         code_object = tb.tb_frame.f_code
@@ -151,12 +179,30 @@ def _failure(exc):
     return _sanitize(result)
 
 
+def _failure_event(failure):
+    return "PHASE_WAITING" if failure.get("error_code") == "IDENTITY_REVIEW_REQUIRED" else "PHASE_FAILED"
+
+
 def emit(event, **fields):
     """Emit transport metadata into the current operation; no global fallback."""
     context = _CONTEXT.get()
     if context is not None:
         logger, bound = context
         logger.write(event, **{**fields, **bound})
+
+
+@contextmanager
+def context_fields(**fields):
+    context = _CONTEXT.get()
+    if context is None:
+        yield
+        return
+    logger, bound = context
+    token = _CONTEXT.set((logger, {**bound, **_sanitize(fields)}))
+    try:
+        yield
+    finally:
+        _CONTEXT.reset(token)
 
 
 class Diagnostics:
@@ -313,7 +359,7 @@ class Diagnostics:
                 failure = _failure(exc)
             except Exception:
                 failure = {"error_code": "INTERNAL_ERROR", "exception_type": "OtherException"}
-            self.write("PHASE_FAILED", **{**bound, **failure, "elapsed_ms": round((time.monotonic() - started) * 1000, 3)})
+            self.write(_failure_event(failure), **{**bound, **failure, "elapsed_ms": round((time.monotonic() - started) * 1000, 3)})
             raise
         else:
             self.write("PHASE_COMPLETED", **{**bound, "elapsed_ms": round((time.monotonic() - started) * 1000, 3)})
@@ -330,7 +376,8 @@ class Diagnostics:
             bound = {**inherited, **_sanitize(fields), "phase": phase}
             if "trace_id" not in bound:
                 bound["trace_id"] = uuid.uuid4().hex
-            self.write("PHASE_FAILED", **{**bound, **_failure(exc)})
+            failure = _failure(exc)
+            self.write(_failure_event(failure), **{**bound, **failure})
         except Exception:
             self._write_error = "WRITE_FAILED"
 

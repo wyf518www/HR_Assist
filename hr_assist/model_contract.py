@@ -19,21 +19,24 @@ FINAL_JSON_INSTRUCTIONS = (
 )
 
 ASSESSMENT_OUTPUT_INSTRUCTIONS = FINAL_JSON_INSTRUCTIONS + (
-    "每个评分条目优先选取1至3条最直接、互补的证据；复杂复合要求或任职时间核验需要更多证据时，以充分支撑结论为先，仍遵守output_schema的上限。"
-    "同一条目不重复相同引文，不把整页简历当作一条证据。短引文仍须保留影响结论的时间、否定词、本人职责和限定条件，不能省略中间文字或拼接。"
-    "reason通常用1至2句说明证据与要求的关系，不复述完整JD、整段引文或计算分数；question仅在需补充信息时提出一个针对性问题，否则用空字符串。"
+    "每个评分条目优先选取1至3个最直接、互补的来源ID；复杂复合要求或任职时间核验需要更多来源时，以充分支撑结论为先，仍遵守output_schema的上限。"
+    "同一条目不重复相同来源ID。每个来源用interpretation简述它对结论的支持或限制，保留时间、否定、本人职责及限定条件的意义。"
+    "不要输出quote，也不要重抄原文；程序按来源ID展示真实原文，模型解释单独展示。"
+    "reason通常用1至2句说明依据与要求的关系，不复述完整JD、整段原文或计算分数；question仅在需补充信息时提出一个针对性问题，否则用空字符串。"
     "精简不能遗漏任何criterion_id，也不能删除必要证据、把未知改为满足或不满足。"
 )
 
 
-ROOT_FIELDS = frozenset({"judgments", "facts"})
-JUDGMENT_FIELDS = frozenset({"criterion_id", "verdict", "evidence", "reason", "question"})
+ROOT_FIELDS = frozenset({"judgments", "facts", "education"})
+JUDGMENT_FIELDS = frozenset({"criterion_id", "verdict", "evidence", "reason", "question", "requirement_mode"})
 FACT_FIELDS = frozenset({"field", "value", "evidence"})
-EVIDENCE_FIELDS = frozenset({"span_id", "quote"})
-SAFE_PATH_FIELDS = ROOT_FIELDS | JUDGMENT_FIELDS | FACT_FIELDS | EVIDENCE_FIELDS
+EVIDENCE_FIELDS = frozenset({"span_id", "interpretation"})
+EDUCATION_FIELDS = frozenset({"degree", "completion", "admission", "institution_match", "catalog_id", "evidence", "interpretation"})
+SAFE_PATH_FIELDS = ROOT_FIELDS | JUDGMENT_FIELDS | FACT_FIELDS | EVIDENCE_FIELDS | EDUCATION_FIELDS
 VERDICT_LABELS = {"满足":"met", "部分满足":"partial", "不满足":"not_met", "未知":"unknown"}
 FORMAT_LABELS = {
     "evidence_whitespace_aligned":"评分引文仅有空格或换行差异，已对齐并保存原文",
+    "fact_evidence_whitespace_aligned":"事实引文仅有空格或换行差异，已对齐并保存原文，取值仍逐字核验",
     "extra_fields_ignored":"忽略契约外字段（包括模型自行给出的分数）",
     "optional_null_to_empty":"可选空值按无信息处理",
     "judgment_evidence_object_to_list":"评分的单条证据对象转为数组",
@@ -98,6 +101,12 @@ def normalize_model_output(raw):
                 record("fact_evidence_single_list_to_object")
             if "evidence" in item:
                 item["evidence"]=project(evidence,EVIDENCE_FIELDS)
+    education=output.get("education")
+    if isinstance(education,dict):
+        education=output["education"]=project(education,EDUCATION_FIELDS)
+        refs=education.get("evidence")
+        if isinstance(refs,list) and len(refs)<=12:
+            education["evidence"]=[project(ref,EVIDENCE_FIELDS) for ref in refs]
     return output,changes
 
 
@@ -136,4 +145,4 @@ def output_schema():
 
 
 def format_adjustment_message(changes):
-    return "已兼容模型输出格式："+"；".join(f"{label} {changes[key]} 处" for key,label in FORMAT_LABELS.items() if changes.get(key))+"。事实、引文和评分条目仍须校验；模型自报分数不参与计算。"
+    return "已兼容模型输出格式："+"；".join(f"{label} {changes[key]} 处" for key,label in FORMAT_LABELS.items() if changes.get(key))+"。来源ID和评分条目仍须校验，语义解释由模型复核；模型自报分数不参与计算。"

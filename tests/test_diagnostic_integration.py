@@ -76,7 +76,7 @@ def test_unwritable_diagnostics_does_not_break_assessment(service,application,mo
     model=FakeModel();monkeypatch.setattr(service,'model',lambda:model)
     def denied(*args,**kwargs):raise PermissionError('private-folder')
     monkeypatch.setattr(service.diagnostics,'_open',denied)
-    assert run(service)['status']=='SUCCESS' and model.calls==1
+    assert run(service)['status']=='SUCCESS' and model.calls==2
     assert service.diagnostics.status()['write_error']=='WRITE_FAILED'
 
 

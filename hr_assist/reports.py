@@ -330,7 +330,7 @@ def overview_export(db, storage):
     sheet.column_dimensions[get_column_letter(len(OVERVIEW_COLUMNS)+1)].hidden=True
     style_sheet(sheet,11)
     evidence=book.create_sheet("评估证据")
-    evidence.append(["记录ID","岗位","JD版本","维度","要求","判定","得分","简历位置","简历引文","JD依据来源"])
+    evidence.append(["记录ID","岗位","JD版本","维度","要求","判定","得分","简历位置","简历原文","JD依据来源","模型解读"])
     for row in rows:
         result=row["assessment"] or {}
         span_map={s["id"]:s for s in result.get("evidence_spans",[])}
@@ -338,10 +338,17 @@ def overview_export(db, storage):
             empty_quote="已确认JD明确不作要求，无须简历证据" if item["verdict"]=="met" and item.get("hard") else "无证据，待核验"
             for ref in item["evidence"] or [{"span_id":"","quote":empty_quote}]:
                 span=span_map.get(ref["span_id"],{})
-                values=[row["id"],row["role_name"],result.get("jd_version_id",""),item["dimension"],item["description"],item["verdict"],item["awarded"],
-                        f"{ref['span_id']} / 第 {span.get('page') or '—'} 页",ref["quote"],"已确认 JD 结构化要求" if item["source"]=="jd" else "用户确认的全局评分规则"]
-                for col,value in enumerate(values,1):
-                    text_cell(evidence.cell(evidence.max_row+1 if col==1 else evidence.max_row,col),value)
+                source=ref['quote']
+                # Excel cells have a character limit. Split long original source
+                # spans into rows instead of silently truncating their evidence.
+                chunks=[source[i:i+15000] for i in range(0,len(source),15000)] or ['']
+                for part,chunk in enumerate(chunks,1):
+                    position=f"{ref['span_id']} / 第 {ref.get('page') or span.get('page') or '—'} 页"
+                    if len(chunks)>1:position+=f" / 原文片段 {part}/{len(chunks)}"
+                    values=[row["id"],row["role_name"],result.get("jd_version_id",""),item["dimension"],item["description"],item["verdict"],item["awarded"],
+                            position,chunk,"已确认 JD 结构化要求" if item["source"]=="jd" else "用户确认的全局评分规则",ref.get('interpretation','') if ref.get('semantic') else '']
+                    for col,value in enumerate(values,1):
+                        text_cell(evidence.cell(evidence.max_row+1 if col==1 else evidence.max_row,col),value)
     style_sheet(evidence,99)
     buffer=BytesIO();book.save(buffer)
     file=storage.put(buffer.getvalue(),"招聘推荐总览.xlsx","reports")
@@ -362,11 +369,14 @@ def role_reports(db, storage, run_id):
             result=row["assessment"]
             items=[]
             for item in result["items"]:
-                quotes="<br>".join(escape(f"{e['span_id']}：{e['quote']}") for e in item["evidence"])
+                quotes="<br>".join(
+                    f"<p>模型解读：{escape(e.get('interpretation',''))}</p><details><summary>对应原文 {escape(e['span_id'])}</summary><pre style='white-space:pre-wrap;overflow-wrap:anywhere'>{escape(e['quote'])}</pre></details>"
+                    if e.get('semantic') else escape(f"{e['span_id']}：{e['quote']}") for e in item["evidence"])
                 verdict={"met":"满足","partial":"部分满足","not_met":"不满足","unknown":"未知，待核验"}[item["verdict"]]
                 items.append(f"<tr><td>{escape(item['description'])}</td><td>{verdict}</td><td>{item['awarded']}/{item['points']}</td><td>{escape(item['reason'])}<br>{quotes}</td></tr>")
             provisional="<p><b>暂计分；存在未知信息，请人工核验。缺少证据不等于不满足要求。</b></p>" if result.get("provisional") else ""
-            sections.append(f"<section><h2>{escape(row['name'])} · {result['score']}/100 · {escape(result['grade'])}</h2>{provisional}<p>{escape(result['gate_reason'])}</p><p>记录 {row['id']} / JD {escape(result.get('jd_version_id',''))}</p><table><tr><th>要求</th><th>判定</th><th>分数</th><th>依据</th></tr>{''.join(items)}</table></section>")
+            review="<p>分析与语义复核均由模型完成；模型解读与服务器保存的原文分开展示，结论仍供人工核验。</p>" if result.get('evidence_mode')=='model_semantic_review' else ''
+            sections.append(f"<section><h2>{escape(row['name'])} · {result['score']}/100 · {escape(result['grade'])}</h2>{provisional}{review}<p>{escape(result['gate_reason'])}</p><p>记录 {row['id']} / JD {escape(result.get('jd_version_id',''))}</p><table><tr><th>要求</th><th>判定</th><th>分数</th><th>依据</th></tr>{''.join(items)}</table></section>")
         document=f"<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>{escape(role)}推荐报告</title><style>body{{max-width:1100px;margin:40px auto;padding:20px;font:15px/1.8 sans-serif;color:#183443}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccd7dc;padding:12px;text-align:left}}section{{margin-top:35px}}</style><h1>{escape(role)}推荐报告</h1><p>生成时间：{now()} / 批次：{run_id}。建议供人工核验，不自动淘汰或录用。</p>{''.join(sections)}</html>"
         files.append(storage.put(document.encode(),f"{role}_推荐报告.html","reports"))
     return files

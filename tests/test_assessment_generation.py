@@ -43,20 +43,20 @@ def test_changed_profile_only_reassesses_when_explicitly_requested(service,appli
     followup=service.db.one('SELECT * FROM followups WHERE application_id=?',(application['id'],))
     configure(service,'low',32768)
     assert run(service)['status']=='SUCCESS'
-    assert len(calls)==1 and service.get_application(application['id'])['assessment_id']==old
+    assert len(calls)==2 and service.get_application(application['id'])['assessment_id']==old
     # Same state transition as the explicit reassess endpoint, retaining history.
     service.db.execute("UPDATE applications SET assessment_id=NULL,status='QUEUED' WHERE id=?",(application['id'],))
     assert run(service)['status']=='SUCCESS'
     current=service.get_application(application['id'])
-    assert len(calls)==2 and current['assessment_id']!=old
-    assert calls[1]['reasoning_effort']=='low' and calls[1]['max_tokens']==32768
+    assert len(calls)==4 and current['assessment_id']!=old
+    assert calls[2]['reasoning_effort']=='low' and calls[2]['max_tokens']==32768
     assert current['assessment']['generation_profile']=={'reasoning_effort':'low','max_tokens':32768}
     assert len(service.db.all('SELECT * FROM assessments'))==2
     assert service.db.one('SELECT * FROM followups WHERE application_id=?',(application['id'],))==followup
     # Explicitly reassess again under identical settings: reuse that profile.
     service.db.execute("UPDATE applications SET assessment_id=NULL,status='QUEUED' WHERE id=?",(application['id'],))
     assert json.loads(run(service)['stats'])['reused']==1
-    assert len(calls)==2
+    assert len(calls)==4
 
 
 def test_settings_saved_after_key_do_not_change_inflight_request_or_audit(service,application,monkeypatch):

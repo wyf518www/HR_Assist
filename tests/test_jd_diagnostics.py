@@ -39,7 +39,7 @@ class LoggedModel:
             raise RuntimeError("DO_NOT_LOG_secret_and_document")
         raw = output()
         if self.failure == "evidence":
-            raw["fields"]["skills"][0]["quote"] = "虚构技能 DO_NOT_LOG"
+            raw["fields"]["skills"][0]["span_id"] = "R-missing"
         emit("MODEL_REQUEST_COMPLETED", request_id="a" * 32)
         return raw, {}
 
@@ -57,18 +57,20 @@ def test_text_analysis_logs_model_in_jd_phase_without_saving_document(diagnostic
     rows = records(service)
     assert result["draft"]["name"] == "软件工程师"
     assert [r["event"] for r in rows] == ["PHASE_STARTED", "MODEL_REQUEST_STARTED",
+                                         "MODEL_REQUEST_COMPLETED", "MODEL_REQUEST_STARTED",
                                          "MODEL_REQUEST_COMPLETED", "PHASE_COMPLETED"]
+    assert [r["model_step"] for r in rows if r["event"] == "MODEL_REQUEST_STARTED"] == ["analysis", "review"]
     assert {r["phase"] for r in rows} == {"jd_text"}
     assert len({r["trace_id"] for r in rows}) == 1
     assert rows[0]["input_characters"] == len(TEXT)
     assert rows[-1]["elapsed_ms"] >= 0
-    assert model.calls == 1
+    assert model.calls == 2
     assert service.roles() == [] and service.db.all("SELECT * FROM jd_imports") == []
     assert_private(rows)
 
 
 @pytest.mark.parametrize("failure,code", [("timeout", "MODEL_TIMEOUT"),
-                                          ("evidence", "JD_EVIDENCE_INVALID"),
+                                          ("evidence", "EVIDENCE_SOURCE_INVALID"),
                                           ("internal", "INTERNAL_ERROR")])
 def test_text_failures_record_safe_code_and_release_lock(diagnostic_jd, service, monkeypatch, failure, code):
     model = LoggedModel(failure)
@@ -80,7 +82,7 @@ def test_text_failures_record_safe_code_and_release_lock(diagnostic_jd, service,
     assert rows[-1]["phase"] == "jd_text"
     assert rows[-1]["elapsed_ms"] >= 0
     assert not diagnostic_jd.text_analysis_lock.locked()
-    assert model.calls == 1
+    assert model.calls == (2 if failure == "evidence" else 1)
     assert_private(rows)
 
 
@@ -97,7 +99,7 @@ def test_import_logs_parse_and_model_linked_to_import(diagnostic_jd, service, mo
     assert len({r["trace_id"] for r in outer}) == 1
     assert rows[-1]["event"] == "PHASE_COMPLETED"
     assert diagnostic_jd.get(item["id"])["status"] == "READY"
-    assert model.calls == 1
+    assert model.calls == 2
     assert_private(rows)
 
 
@@ -110,11 +112,11 @@ def test_import_failure_retains_text_and_does_not_retry(diagnostic_jd, service, 
     rows = records(service)
     assert rows[-1]["phase"] == "jd_import"
     assert rows[-1]["event"] == "PHASE_FAILED"
-    assert rows[-1]["error_code"] == "JD_EVIDENCE_INVALID"
+    assert rows[-1]["error_code"] == "EVIDENCE_SOURCE_INVALID"
     row = diagnostic_jd.get(item["id"])
     assert row["status"] == "FAILED" and row["text"] == TEXT and row["attempts"] == 1
     assert service.storage.file(row["file_id"])[1].read_bytes() == TEXT.encode()
-    assert model.calls == 1
+    assert model.calls == 2
     assert_private(rows)
 
 

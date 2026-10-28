@@ -20,19 +20,25 @@ def compact_layout(text):
     return ''.join(chars), positions
 
 
-def locate_quote(text, quote):
+def locate_quote_with_reason(text, quote):
     """Return the actual contiguous source slice, tolerating only layout whitespace.
 
     Keep punctuation, digits, word order and negations exact. A normalized match
     must be unique. Persist the source slice rather than the model's rendering.
     """
     if not quote.strip():
-        return None
+        return None, 'empty_quote'
     if quote in text:
-        return quote
+        return quote, None
     compact,positions = compact_layout(text)
     needle,_ = compact_layout(quote)
     start = compact.find(needle)
-    if not needle or start < 0 or compact.find(needle, start + 1) >= 0:
-        return None
-    return text[positions[start]:positions[start + len(needle) - 1] + 1]
+    if not needle or start < 0:
+        return None, 'no_match'
+    if compact.find(needle, start + 1) >= 0:
+        return None, 'ambiguous_match'
+    return text[positions[start]:positions[start + len(needle) - 1] + 1], None
+
+
+def locate_quote(text, quote):
+    return locate_quote_with_reason(text, quote)[0]

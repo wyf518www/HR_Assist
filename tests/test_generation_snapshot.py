@@ -7,7 +7,8 @@ import httpx
 import pytest
 
 from hr_assist.db import dump
-from hr_assist.identities import VERSION
+from hr_assist.identities import SYSTEM, VERSION
+from hr_assist.semantic import REVIEW_INSTRUCTIONS
 from hr_assist.storage import BusinessError
 from conftest import make_pdf
 from test_core import configure
@@ -49,14 +50,15 @@ def setup_identity(service, role):
     return app, answer('测试候选人', role['name'], role['id'], filename)
 
 
-def test_default_identity_fingerprint_remains_legacy_compatible(service, role):
+def test_default_identity_fingerprint_includes_complete_analysis_contract(service, role):
     app, _ = setup_identity(service, role)
     settings = options(service, 'default', None)
     payload, fingerprint = service.identities.context(app)
-    legacy = {'sources': payload['sources'], 'roles': payload['available_roles'],
+    contract = {'sources': payload['sources'], 'roles': payload['available_roles'],
               'manual': payload['human_confirmed'], 'model': settings['model'],
-              'endpoint': settings['endpoint'], 'version': VERSION}
-    assert fingerprint == hashlib.sha256(dump(legacy).encode()).hexdigest()
+              'endpoint': settings['endpoint'], 'version': VERSION, 'system': SYSTEM,
+              'review_system': REVIEW_INSTRUCTIONS, 'output_schema': payload['output_schema']}
+    assert fingerprint == hashlib.sha256(dump(contract).encode()).hexdigest()
     options(service)
     assert service.identities.context(app)[1] != fingerprint
 
@@ -74,24 +76,24 @@ def test_new_mode_reanalyzes_pending_proposal_and_old_apply_is_rejected(service,
     assert caught.value.code == 'IDENTITY_STALE'
     assert service.db.one('SELECT * FROM applications WHERE id=?', (app['id'],)) == before
     second = service.identities.analyze(app, lambda: None)
-    assert second['id'] != first['id'] and len(calls) == 2
-    assert [item['reasoning_effort'] for item in calls] == ['low', 'high']
+    assert second['id'] != first['id'] and len(calls) == 4
+    assert [item['reasoning_effort'] for item in calls] == ['low', 'low', 'high', 'high']
     assert first['generation_profile'] == {'reasoning_effort': 'low', 'max_tokens': 32768}
     assert second['generation_profile'] == {'reasoning_effort': 'high', 'max_tokens': 32768}
     assert service.identities.analyze(app, lambda: None)['id'] == second['id']
-    assert len(calls) == 2
+    assert len(calls) == 4
 
 
 def test_applied_identity_survives_new_mode_and_only_force_reanalyzes(service, role, monkeypatch):
     app, response = setup_identity(service, role)
     calls = capture_transport(monkeypatch, response)
     resolved = service.identities.resolve(app, lambda: None)
-    assert service.identities.complete(resolved) and len(calls) == 1
+    assert service.identities.complete(resolved) and len(calls) == 2
     options(service, 'high')
     assert service.identities.resolve(resolved, lambda: pytest.fail('unexpected reservation')) == resolved
-    assert len(calls) == 1
+    assert len(calls) == 2
     proposal = service.identities.analyze(resolved, lambda: None, force=True)
-    assert len(calls) == 2 and calls[-1]['reasoning_effort'] == 'high'
+    assert len(calls) == 4 and calls[-1]['reasoning_effort'] == 'high'
     assert proposal['generation_profile']['reasoning_effort'] == 'high'
     current = service.get_application(app['id'])
     assert current['name'] == resolved['name'] and current['role_id'] == resolved['role_id']
@@ -121,7 +123,7 @@ def test_identity_config_change_during_parsing_is_rejected_before_io(service, ro
     assert proposal['generation_profile'] == {'reasoning_effort': 'max', 'max_tokens': 65536}
     assert calls[0]['reasoning_effort'] == 'max' and calls[0]['max_tokens'] == 65536
     sent = json.loads(calls[0]['messages'][1]['content'])
-    assert sent == payload
+    assert sent == {**payload,'task_stage':'analysis'}
     assert complete_text in next(s['text'] for s in sent['sources'] if s['id'] == 'R1')
     assert service.settings()['llm']['reasoning_effort'] == 'max'
 

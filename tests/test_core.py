@@ -123,11 +123,11 @@ class FakeModel:
         if 'available_roles' in payload:
             # A literal synthetic model response, not a production parser.
             filename=next(s for s in payload['sources'] if s['id']=='F1')['text']
-            return {'name':{'status':'identified','value':'Test','evidence':[{'span_id':'F1','quote':filename}],'note':'Synthetic'},
+            return {'name':{'status':'identified','value':'Test','evidence':[{'span_id':'F1','interpretation':'附件明确显示本次投递信息'}],'note':'Synthetic'},
                     'role':{'status':'identified','value':'软件工程师','role_id':payload['available_roles'][0]['id'],
-                            'evidence':[{'span_id':'F1','quote':filename}],'note':'Synthetic'}},{'total_tokens':10}
+                            'evidence':[{'span_id':'F1','interpretation':'附件明确显示本次投递信息'}],'note':'Synthetic'}},{'total_tokens':10}
         span=payload['resume_spans'][0]
-        return {'judgments':[{'criterion_id':c['id'],'verdict':'met','evidence':[{'span_id':span['id'],'quote':span['text']}],'reason':'测试证据支持'} for c in payload['criteria']]}, {'total_tokens':10}
+        return {'judgments':[{'criterion_id':c['id'],'verdict':'met','evidence':[{'span_id':span['id'],'interpretation':'简历经历支持该项要求'}],'reason':'测试证据支持'} for c in payload['criteria']]}, {'total_tokens':10}
 
 
 def configure(service):
@@ -141,12 +141,12 @@ def test_assessment_cache_explicit_reassessment(service,application,monkeypatch)
     model=FakeModel();monkeypatch.setattr(service,'model',lambda:model)
     result=run(service,key='test-idempotent')
     assert result['status']=='SUCCESS'
-    assert model.calls==1
+    assert model.calls==2
     assert service.get_application(application['id'])['assessment']['score']==100
-    assert run(service)['status']=='SUCCESS' and model.calls==1
+    assert run(service)['status']=='SUCCESS' and model.calls==2
     assert service.start_run('pending','test-idempotent')['id']==result['id']
     service.db.execute('UPDATE applications SET assessment_id=NULL WHERE id=?',(application['id'],))
-    assert json.loads(run(service)['stats'])['reused']==1 and model.calls==1
+    assert json.loads(run(service)['stats'])['reused']==1 and model.calls==2
 
 
 def test_mail_failure_cursor_and_retry(service,role,pdf,monkeypatch):
@@ -178,7 +178,7 @@ def test_document_review_invalidates_cache_and_preserves_history(service,applica
     service.verify_document(application['id'],'Verified synthetic Python engineer, 5 years experience.','Checked against original PDF')
     assert service.get_application(application['id'])['assessment'] is None
     run(service)
-    assert model.calls==2
+    assert model.calls==4
     updated=service.get_application(application['id'])
     assert len(updated['history'])==2
     assert updated['document']['spans'][0]['source']=='verified'

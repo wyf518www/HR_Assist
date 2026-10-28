@@ -39,7 +39,8 @@ def test_assessment_sends_final_output_constraints_without_truncating_sources():
     assert payload['resume_spans'] == original == spans
     assert [item['id'] for item in payload['criteria']] == [item['id'] for item in criteria]
     assert len(result['items']) == len(criteria)
-    assert result['prompt_version'] == 'v7-model-identity'
+    assert result['prompt_version'] == 'v8-semantic-review'
+    assert len(model.calls)==2 and model.calls[1][1]['task_stage']=='semantic_review'
 
 
 def test_identity_constraints_keep_full_sources_and_reuse_existing_proposal(service, application, monkeypatch):
@@ -48,7 +49,7 @@ def test_identity_constraints_keep_full_sources_and_reuse_existing_proposal(serv
     source = '任职资料完整保留。' * 1000
     monkeypatch.setattr(service, 'parse_document', lambda *a, **kw: [
         {'id': 'R1', 'page': 1, 'source': 'text', 'text': source}])
-    reference = {'span_id': 'F1', 'quote': app['original_name']}
+    reference = {'span_id': 'F1', 'interpretation': '附件标题表示本次投递的姓名和岗位'}
     result = {
         'name': {'status': 'identified', 'value': 'Test', 'evidence': [reference], 'note': '附件明确记载'},
         'role': {'status': 'identified', 'value': '软件工程师', 'role_id': app['role_id'],
@@ -61,8 +62,8 @@ def test_identity_constraints_keep_full_sources_and_reuse_existing_proposal(serv
     system, payload = model.calls[0]
     assert FINAL_JSON_INSTRUCTIONS in system
     assert next(s['text'] for s in payload['sources'] if s['id'] == 'R1') == source
-    assert proposal['version'] == 'identity-v1-model'
-    assert repeated['id'] == proposal['id'] and len(model.calls) == 1
+    assert proposal['version'] == 'identity-v2-semantic-review'
+    assert repeated['id'] == proposal['id'] and len(model.calls) == 2
     assert service.get_application(app['id'])['name'] == app['name']
 
 
@@ -77,17 +78,20 @@ def test_jd_constraints_preserve_all_source_requirements_and_leave_draft_unappro
     assert payload['jd_spans'][0]['text'] == text
     assert result['draft']['fields']['skills'] == '技能：Python、SQL，Docker 优先'
     assert result['draft']['approved'] is False
-    assert result['prompt_version'] == 'jd-extract-v3-no-location'
+    assert result['prompt_version'] == 'jd-extract-v4-semantic-review'
+    assert len(model.calls) == 2 and model.calls[1][1]['task_stage'] == 'semantic_review'
     assert service.roles() == []
 
 
-def test_compact_evidence_target_is_not_a_hard_three_quote_limit():
+def test_compact_evidence_target_is_not_a_hard_three_source_limit():
     raw, spans, criteria, policy = sample()
-    refs = [{'span_id': 'R1', 'quote': quote} for quote in ['本科', '统招', '测试大学', '证书A']]
+    refs = [{'span_id': 'R1', 'interpretation': description} for description in ['本科', '统招', '测试大学', '证书A']]
     raw['judgments'][0]['evidence'] = refs
     result = validate_and_score(raw, spans, criteria, policy, False)
-    assert result['items'][0]['evidence'] == refs
-    raw['judgments'][0]['evidence'][3]['quote'] = '原文不存在的证书'
+    assert len(result['items'][0]['evidence'])==4
+    assert [r['interpretation'] for r in result['items'][0]['evidence']]==[r['interpretation'] for r in refs]
+    assert all(r['quote']==spans[0]['text'] for r in result['items'][0]['evidence'])
+    raw['judgments'][0]['evidence'][3]['span_id'] = 'unknown-source'
     with pytest.raises(BusinessError) as error:
         validate_and_score(raw, spans, criteria, policy, False)
-    assert error.value.code == 'EVIDENCE_INVALID'
+    assert error.value.code == 'EVIDENCE_SOURCE_INVALID'

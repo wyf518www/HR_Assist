@@ -31,8 +31,8 @@ SPANS = [{"id": "R1", "page": 1, "text": TEXT, "source": "text"}]
 
 
 def output():
-    return {"name": {"value": "软件工程师", "evidence": {"span_id": "R1", "quote": "岗位：软件工程师"}},
-            "fields": {k: [{"span_id": "R1", "quote": v}] for k, v in QUOTES.items()}, "multiple_roles": False}
+    return {"name": {"value": "软件工程师", "evidence": {"span_id": "R1", "interpretation": "岗位：软件工程师"}},
+            "fields": {k: [{"span_id": "R1", "interpretation": v}] for k, v in QUOTES.items()}, "multiple_roles": False}
 
 
 class QuoteModel:
@@ -71,7 +71,7 @@ def confirmation(row, **kwargs):
                                           fields=row["draft"]["fields"], approved=True), reviewed=True, **kwargs)
 
 
-def test_extraction_quotes_missing_ocr_and_no_automatic_sales():
+def test_extraction_semantics_missing_ocr_and_no_automatic_sales():
     raw = output()
     raw["fields"]["certificates"] = []
     draft = validate_extraction(raw, [{**SPANS[0], "source": "ocr"}])
@@ -82,13 +82,13 @@ def test_extraction_quotes_missing_ocr_and_no_automatic_sales():
     assert draft["approved"] is False and draft["is_sales"] is False
 
 
-@pytest.mark.parametrize("case,code", [("quote", "JD_EVIDENCE_INVALID"), ("span", "JD_EVIDENCE_INVALID"),
+@pytest.mark.parametrize("case,code", [("legacy_quote", "JD_MODEL_SCHEMA"), ("span", "EVIDENCE_SOURCE_INVALID"),
     ("name", "JD_NAME_INVALID"), ("multiple", "JD_MULTIPLE_ROLES"), ("free_text", "JD_MODEL_SCHEMA")])
 def test_unverifiable_model_outputs_rejected(case, code):
     raw = output()
-    if case == "quote": raw["fields"]["skills"][0]["quote"] = "必须精通 Java"
+    if case == "legacy_quote": raw["fields"]["skills"][0] = {"span_id":"R1","quote":"旧契约不用于新分析"}
     if case == "span": raw["fields"]["skills"][0]["span_id"] = "R999"
-    if case == "name": raw["name"]["value"] = "销售经理"
+    if case == "name": raw["name"]["value"] = "销售/经理"
     if case == "multiple": raw["multiple_roles"] = True
     if case == "free_text": raw["fields"]["education"] = "博士"
     with pytest.raises(BusinessError) as error:
@@ -107,10 +107,10 @@ def test_original_dedup_redaction_metadata_and_atomic_save(queue, service):
     assert "test@example.invalid" not in dump(model.calls)
     assert "13800000000" not in dump(model.calls)
     assert "must-not-be-stored" not in dump(row)
-    assert row["metadata"]["usage"]["total_tokens"] == 42
+    assert row["metadata"]["usage"]["total_tokens"] == 84
     duplicate = imports.enqueue(TEXT.encode(), "renamed.txt")
     assert duplicate["duplicate"] and duplicate["id"] == row["id"]
-    assert not imports.process_next() and len(model.calls) == 1
+    assert not imports.process_next() and len(model.calls) == 2
     file, path = service.storage.file(row["file_id"])
     assert path.read_bytes() == TEXT.encode()
     assert file["sha256"] == hashlib.sha256(TEXT.encode()).hexdigest()
@@ -184,7 +184,7 @@ def test_per_file_failure_retry_and_manual_fallback(queue, service, monkeypatch)
     imports.process_next(); imports.process_next()
     assert imports.get(bad["id"])["status"] == "FAILED"
     assert imports.get(good["id"])["status"] == "READY"
-    assert len(model.calls) == 1
+    assert len(model.calls) == 2
     with pytest.raises(BusinessError): imports.retry(good["id"])
     model.fail = True
     imports.retry(bad["id"])
@@ -207,7 +207,7 @@ def test_retry_reuses_text_and_can_succeed(queue, monkeypatch):
     imports.retry(row["id"]); imports.process_next()
     assert imports.get(row["id"])["status"] == "READY"
     assert imports.get(row["id"])["attempts"] == 2
-    assert len(model.calls) == 2
+    assert len(model.calls) == 3
 
 
 def test_unapproved_model_format_size_capacity_and_revocation(service, queue, monkeypatch):
@@ -235,7 +235,7 @@ def test_restart_marks_inflight_interrupted_without_rebilling(queue, service):
         time.sleep(.02)
     assert imports.get(active["id"])["status"] == "INTERRUPTED"
     assert imports.get(waiting["id"])["status"] == "READY"
-    assert len(model.calls) == 1
+    assert len(model.calls) == 2
 
 
 @pytest.mark.parametrize("extension", ["txt", "docx", "pdf"])
@@ -249,7 +249,7 @@ def test_real_extraction_in_background_pipeline(service, monkeypatch, extension)
         settings = {"model": "test"}
         def complete(self, system, payload):
             span = payload["jd_spans"][0]
-            return {"name": {"value": "", "evidence": None}, "fields": {"skills": [{"span_id": span["id"], "quote": "Python"}]}}, {}
+            return {"name": {"value": "", "evidence": None}, "fields": {"skills": [{"span_id": span["id"], "interpretation": "Python"}]}}, {}
     monkeypatch.setattr(service, "model", Model)
     row = service.jd_imports.enqueue(data, "JD." + extension)
     service.jd_imports.process_next()

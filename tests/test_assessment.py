@@ -1,34 +1,43 @@
 from copy import deepcopy
 import pytest
-from hr_assist.assessment import validate_and_score, default_criteria, redact
+from hr_assist.assessment import validate_and_score, default_criteria, redact, education_catalog
 from hr_assist.storage import BusinessError
 
 
 def sample():
     criteria=default_criteria(dict(education='本科',experience='三年',location='北京',certificates='证书A',availability='一周',skills='Python',responsibilities='开发'))
     spans=[{'id':'R1','page':1,'source':'text','text':'本科 统招 测试大学 Python 开发 三年 北京 证书A 一周'}]
-    evidence={'span_id':'R1','quote':spans[0]['text']}
+    evidence={'span_id':'R1','interpretation':'语义支持要求'}
     raw={'judgments':[{'criterion_id':c['id'],'verdict':'met','evidence':[evidence],'reason':'原文可定位'} for c in criteria],
          'facts':[{'field':k,'value':v,'evidence':evidence} for k,v in [('education_level','本科'),('admission','统招'),('institution','测试大学')]]}
-    return raw,spans,criteria,{'schools':['测试大学'],'master_bypass':True}
+    policy={'schools':['测试大学'],'master_bypass':True}
+    raw['education']={'degree':'bachelor','completion':'attained','admission':'national_regular',
+        'institution_match':'catalog','catalog_id':education_catalog(policy)[0]['id'],
+        'evidence':[evidence],'interpretation':'同一已取得的本科教育经历'}
+    return raw,spans,criteria,policy
 
 
 def test_scoring_hard_gate_and_unknown_not_rejection():
     raw,spans,criteria,policy=sample()
     assert validate_and_score(raw,spans,criteria,policy,False)['grade']=='强烈推荐'
-    policy['schools']=['另一大学']
+    raw['education'].update(institution_match='not_in_catalog',catalog_id=None)
     assert validate_and_score(raw,spans,criteria,policy,False)['grade']=='待定'
     for item in raw['judgments']:item['verdict']='unknown';item['evidence']=[]
     result=validate_and_score(raw,spans,criteria,policy,True)
     assert result['score']==0 and result['grade']=='待定' and result['provisional']
 
 
-def test_fabricated_evidence_and_fact_rejected():
+def test_unknown_source_rejected_and_semantic_fact_is_not_literal_matched():
     raw,spans,criteria,policy=sample()
-    raw['judgments'][0]['evidence']=[{'span_id':'R1','quote':'虚构经历'}]
-    with pytest.raises(BusinessError,match='定位'):validate_and_score(raw,spans,criteria,policy,False)
-    raw,spans,criteria,policy=sample();raw['facts'][0]['value']='硕士'
-    with pytest.raises(BusinessError,match='核验'):validate_and_score(raw,spans,criteria,policy,False)
+    raw['judgments'][0]['evidence']=[{'span_id':'unknown-source','interpretation':'模型解释'}]
+    with pytest.raises(BusinessError) as caught:
+        validate_and_score(raw,spans,criteria,policy,False)
+    assert caught.value.code=='EVIDENCE_SOURCE_INVALID'
+    raw,spans,criteria,policy=sample()
+    raw['facts'].append({'field':'experience','value':'3年','evidence':{'span_id':'R1','interpretation':'三年的规范表达'}})
+    result=validate_and_score(raw,spans,criteria,policy,False)
+    assert result['facts']['experience']=='3年'
+    assert result['fact_refs']['experience']['quote']==spans[0]['text']
 
 
 def test_ocr_critical_evidence_unknown_and_redaction():
@@ -44,10 +53,11 @@ def test_full_time_does_not_claim_unified_admission():
     raw,spans,criteria,policy=sample()
     spans[0]['text']=spans[0]['text'].replace('统招','全日制')
     for item in raw['judgments']:
-        item['evidence']=[{'span_id':'R1','quote':spans[0]['text']}]
+        item['evidence']=[{'span_id':'R1','interpretation':'只确定全日制，不能据此判定统招'}]
     for fact in raw['facts']:
-        fact['evidence']={'span_id':'R1','quote':spans[0]['text']}
+        fact['evidence']={'span_id':'R1','interpretation':'只确定全日制，不能据此判定统招'}
         if fact['field']=='admission':fact['value']='全日制'
+    raw['education']['admission']='unknown'
     assert validate_and_score(raw,spans,criteria,policy,False)['education_gate']=='unknown'
 
 

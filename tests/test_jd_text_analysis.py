@@ -42,17 +42,17 @@ def test_editor_failure_and_concurrency_leave_roles_unchanged(service, role, mon
     assert service.jd_imports.analyze_text(TEXT)['draft']['name']=='软件工程师'
 
 
-def test_editor_hallucinated_fields_are_not_returned(service, monkeypatch):
+def test_editor_unknown_sources_are_not_returned(service, monkeypatch):
     configure(service)
     class InvalidModel:
         settings={'model':'synthetic-invalid'}
         def complete(self,system,payload):
-            raw=output();raw['fields']['skills'][0]['quote']='虚构技能 Ruby'
+            raw=output();raw['fields']['skills'][0]['span_id']='R-missing'
             return raw,{}
     monkeypatch.setattr(service,'model',InvalidModel)
     with pytest.raises(BusinessError) as error:
         service.jd_imports.analyze_text(TEXT)
-    assert error.value.code=='JD_EVIDENCE_INVALID'
+    assert error.value.code=='EVIDENCE_SOURCE_INVALID'
     assert service.roles()==[]
 
 
@@ -83,5 +83,5 @@ def test_editor_api_requires_login_csrf_and_confirmation(environment,monkeypatch
         response=client.post('/api/jd/analyze-text',json=body)
         assert response.status_code==200
         assert response.json()['draft']['fields']['education']=='学历：本科及以上'
-        assert len(model.calls)==1
+        assert len(model.calls)==2
         assert client.get('/api/roles').json()==[]

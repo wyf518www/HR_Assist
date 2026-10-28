@@ -129,15 +129,17 @@ def test_profile_diagnostic_allowlist_rejects_untrusted_values():
         assert _sanitize(fields) == {}
 
 
-def test_default_cache_hash_exactly_preserved_and_explicit_options_separate():
+def test_semantic_cache_hash_and_explicit_options_separate():
     app = {'file_id': 'f', 'role_id': 'r', 'name': 'Test', 'name_confirmed': True}
     jd, policy, spans = {'id': 'j'}, {'confirmed': True}, []
     config = settings()
-    old_payload = {'file': 'f', 'role': 'r', 'jd': 'j', 'policy': policy,
+    payload = {'file': 'f', 'role': 'r', 'jd': 'j', 'policy': policy,
                    'model': config['model'], 'endpoint': config['endpoint'], 'prompt': ASSESSMENT_PROMPT_VERSION,
-                   'schema': 'v1', 'redaction': 'v2-name-review', 'name': 'Test', 'name_confirmed': True,
+                   'schema': 'v2-semantic', 'redaction': 'v2-name-review', 'name': 'Test', 'name_confirmed': True,
                    'document': hashlib.sha256(dump(spans).encode()).hexdigest()}
-    expected = hashlib.sha256(dump(old_payload).encode()).hexdigest()
+    expected = hashlib.sha256(dump(payload).encode()).hexdigest()
+    legacy = hashlib.sha256(dump({**payload, 'schema': 'v1'}).encode()).hexdigest()
+    assert expected != legacy
     assert assessment_key(app, jd, policy, config, spans) == expected
     assert assessment_key(app, jd, policy, {**config, 'reasoning_effort': 'default', 'max_tokens': None}, spans) == expected
     keys = {expected}

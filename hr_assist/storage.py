@@ -9,9 +9,12 @@ from .db import now, uid
 
 
 class BusinessError(Exception):
-    def __init__(self, code, message, status=400):
+    def __init__(self, code, message, status=400, *, diagnostics=None):
         super().__init__(message)
         self.code, self.message, self.status = code, message, status
+        # Only explicit, allowlisted metadata is consumed by the diagnostic logger.
+        # Never derive this from message text, credentials, or model output strings.
+        self.diagnostics = dict(diagnostics) if isinstance(diagnostics, dict) else {}
 
 
 def safe_filename(name):

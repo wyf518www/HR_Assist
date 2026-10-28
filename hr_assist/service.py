@@ -282,7 +282,7 @@ class Service:
         row["document"]={**document,"spans":json.loads(document["spans"])} if document else None
         row["name_confirmed"]=self.name_is_confirmed(row)
         row['identity_complete']=self.identities.complete(row)
-        row["name_review_required"]=bool(not row["name_confirmed"] and document and name_looks_like_location(row["document"]["spans"],row["name"]))
+        row["name_review_required"]=bool(not row["name_confirmed"] and not row['identity_complete'] and document and name_looks_like_location(row["document"]["spans"],row["name"]))
         row["history"]=self.db.all("SELECT id,jd_version_id,status,created_at FROM assessments WHERE application_id=? ORDER BY created_at DESC",(identity,))
         return row
 
@@ -540,8 +540,7 @@ class Service:
                         if cached:
                             result=json.loads(cached["result"]);assessment_id=cached["id"];stats["reused"]+=1
                         else:
-                            reserve()
-                            result=assess(model,application,jd,spans,config["policy"])
+                            result=assess(model,application,jd,spans,config["policy"],db=self.db,reserve=reserve)
                             result["jd_version_id"]=jd["id"]
                             assessment_id=uid()
                             self.db.execute("INSERT INTO assessments VALUES (?,?,?,?,?,?,?)",(assessment_id,application["id"],jd["id"],key,"COMPLETED",dump(result),now()))
@@ -613,7 +612,7 @@ class Service:
                 try:
                     previous=self.identities.proposal(app['id'])
                     marker=self.db.get('identity_applied:'+app['id'],{})
-                    if not force and previous and marker.get('proposal_id')==previous['id'] and self.identities.complete(app):
+                    if not force and previous and marker.get('proposal_id')==previous['id'] and self.identities.complete(app) and not self.db.get('identity_pending:'+app['id']):
                         stats['identity_reused']+=1
                         continue
                     before=calls

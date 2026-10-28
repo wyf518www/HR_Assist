@@ -132,7 +132,7 @@ def test_inactive_pending_paused_and_resumes_only_after_enable(service,role,appl
     assert service.get_application(application['id'])['status']=='ROLE_INACTIVE'
     service.change_role(role['id'],action(role,True))
     assert run(service)['status']=='SUCCESS'
-    assert model.calls==1
+    assert model.calls==2
 
 
 def test_role_action_version_and_running_task_guards(service,role,role_data):

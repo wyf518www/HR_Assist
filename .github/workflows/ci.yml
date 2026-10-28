@@ -15,7 +15,7 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest -q
       - run: node --check hr_assist/web/app.js
-      - run: node --test tests/test_page_navigation.js tests/test_model_settings.js tests/test_candidate_query.js tests/test_candidate_list.js
+      - run: node --test tests/test_page_navigation.js tests/test_model_settings.js tests/test_candidate_query.js tests/test_candidate_list.js tests/test_diagnostic_reasons.js tests/test_semantic_assessment_ui.js tests/test_semantic_source_ui.js
       - run: docker build -t hr-assist:ci .
       - name: Container authentication, OCR and persistence smoke test
         run: python scripts/container_smoke.py

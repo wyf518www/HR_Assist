@@ -48,7 +48,7 @@ def test_actual_negative_evidence_is_not_downgraded():
     raw, spans, criteria, policy = sample()
     spans.append({'id': 'R2', 'page': 2, 'source': 'text', 'text': '尚未取得证书A'})
     item = next(j for j in raw['judgments'] if j['criterion_id'] == 'certificates')
-    item.update(verdict='not_met', evidence=[{'span_id': 'R2', 'quote': spans[-1]['text']}], reason='原文明确未取得要求的证书')
+    item.update(verdict='not_met', evidence=[{'span_id': 'R2', 'interpretation': '该来源明确说明尚未取得证书'}], reason='原文明确未取得要求的证书')
     result = validate_and_score(raw, spans, criteria, policy, False)
     assert result['hard_fail'] and not result['provisional']
     assert result['validation_warnings'] == []
@@ -56,26 +56,39 @@ def test_actual_negative_evidence_is_not_downgraded():
 
 
 @pytest.mark.parametrize('verdict', ['met', 'partial', 'not_met', 'unknown'])
-@pytest.mark.parametrize('evidence', [
-    {'span_id': 'private-bad-id', 'quote': '本科'},
-    {'span_id': 'R1', 'quote': 'private-bad-quote'},
-    {'span_id': 'R1', 'quote': ' '},
+@pytest.mark.parametrize('evidence,code', [
+    ({'span_id': 'private-bad-id', 'interpretation': '模型认为支持该条件'}, 'EVIDENCE_SOURCE_INVALID'),
+    ({'span_id': 'R1', 'interpretation': ' '}, 'MODEL_SCHEMA'),
+    ({'span_id': 'R1', 'quote': 'private-bad-quote'}, 'MODEL_SCHEMA'),
 ])
-def test_invalid_or_blank_quote_still_stops_scoring(verdict, evidence):
+def test_missing_source_or_empty_interpretation_still_stops_scoring(verdict, evidence, code):
     raw, spans, criteria, policy = sample()
     raw['judgments'][0].update(verdict=verdict, evidence=[evidence])
     with pytest.raises(BusinessError) as error:
         validate_and_score(raw, spans, criteria, policy, False)
-    assert error.value.code == 'EVIDENCE_INVALID'
-    assert '评分第1项' in error.value.message and '学历' in error.value.message
+    assert error.value.code == code
+    if code == 'EVIDENCE_SOURCE_INVALID':
+        assert error.value.diagnostics['criterion_index'] == 1
+        assert error.value.diagnostics['criterion_dimension'] == 'hard'
     assert 'private-bad' not in error.value.message
+
+
+def test_reviewed_interpretation_is_not_presented_as_a_source_quote():
+    raw, spans, criteria, policy = sample()
+    interpretation='该教育经历可对应本科要求，表述可以经过整理'
+    raw['judgments'][0]['evidence']=[{'span_id':'R1','interpretation':interpretation}]
+    result=validate_and_score(raw,spans,criteria,policy,False)
+    reference=result['items'][0]['evidence'][0]
+    assert reference['interpretation']==interpretation
+    assert reference['quote']==spans[0]['text']
+    assert reference['semantic'] is True
 
 
 def test_explicit_unrestricted_jd_does_not_need_resume_evidence():
     raw, spans, criteria, policy = sample()
     next(c for c in criteria if c['id'] == 'certificates')['description'] = '证书：不限'
     judgment = next(j for j in raw['judgments'] if j['criterion_id'] == 'certificates')
-    judgment.update(verdict='not_met', evidence=[], reason='private-invented-certificate', question='private-invented-question')
+    judgment.update(requirement_mode='unrestricted', verdict='not_met', evidence=[], reason='private-invented-certificate', question='private-invented-question')
     result = validate_and_score(raw, spans, criteria, policy, True)
     item = next(i for i in result['items'] if i['id'] == 'certificates')
     assert item['verdict'] == 'met' and item['awarded'] == 3
@@ -115,7 +128,7 @@ def test_new_evidence_prompt_does_not_reuse_previous_prompt_cache(monkeypatch):
     assert current != assessment_key(*args)
 
 
-def test_missing_evidence_completes_for_review_without_second_model_call(service, application, monkeypatch):
+def test_missing_evidence_completes_after_two_pass_review_without_further_retries(service, application, monkeypatch):
     configure(service)
     class MissingModel(FakeModel):
         def complete(self, system, payload):
@@ -132,7 +145,7 @@ def test_missing_evidence_completes_for_review_without_second_model_call(service
     stats = json.loads(record['stats'])
     assert record['status'] == 'SUCCESS_WITH_EXCEPTIONS'
     assert stats['assessed'] == 1 and stats['exceptions'] == 1 and stats['grades']['待定'] == 1
-    assert model.calls == 1
+    assert model.calls == 2
     row = service.get_application(application['id'])
     assert row['assessment']['score'] == 90 and row['assessment']['provisional']
     assert row['assessment']['prompt_version'] == ASSESSMENT_PROMPT_VERSION
@@ -142,7 +155,7 @@ def test_missing_evidence_completes_for_review_without_second_model_call(service
     assert 'private-unsupported' not in dump(events)
     assert any(e['code'] == 'EVIDENCE_DOWNGRADED' and '项目成果' in e['message'] for e in events)
     assert any(e['code'] == 'ASSESSED' and '暂计分' in e['message'] for e in events)
-    assert '未提及不等于不满足' in model.system
+    assert '不能把缺失信息当不满足' in model.system
     # Workbook and HTML use the neutral replacement, not unsupported model prose.
     file = overview_export(service.db, service.storage)
     book = load_workbook(BytesIO(service.storage.file(file['id'])[1].read_bytes()))
@@ -157,4 +170,4 @@ def test_missing_evidence_completes_for_review_without_second_model_call(service
     for report in reports:
         html = service.storage.file(report['id'])[1].read_text(encoding='utf-8')
         assert '暂计分' in html and '未知，待核验' in html and 'private-unsupported' not in html
-    assert run(service)['status'] == 'SUCCESS' and model.calls == 1
+    assert run(service)['status'] == 'SUCCESS' and model.calls == 2

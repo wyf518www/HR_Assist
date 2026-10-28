@@ -3,6 +3,7 @@ from urllib.parse import urlsplit
 import re
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from .semantic import SemanticReference
 
 
 class Input(BaseModel):
@@ -220,17 +221,31 @@ class Evidence(Input):
 class Judgment(Input):
     criterion_id: str
     verdict: Literal["met", "partial", "not_met", "unknown"]
-    evidence: list[Evidence] = Field(default_factory=list, max_length=12)
+    evidence: list[SemanticReference] = Field(default_factory=list, max_length=12)
     reason: str = Field(max_length=1500)
     question: str = Field(default="", max_length=1500)
+    requirement_mode: Literal["required", "unrestricted"] = "required"
 
 
 class Fact(Input):
     field: Literal["company", "education_level", "admission", "institution", "experience"]
     value: str = Field(max_length=200)
-    evidence: Evidence
+    evidence: SemanticReference
+
+
+class EducationResult(Input):
+    # All fields describe one education record, not a merge of unrelated schools
+    # or degrees. Semantic interpretation is model-reviewed; policy is local.
+    degree: Literal["bachelor", "master", "doctor", "other", "unknown"]
+    completion: Literal["attained", "in_progress", "unknown"]
+    admission: Literal["national_regular", "non_regular", "unknown"]
+    institution_match: Literal["catalog", "not_in_catalog", "unknown"]
+    catalog_id: str | None = Field(default=None, max_length=100)
+    evidence: list[SemanticReference] = Field(default_factory=list, max_length=12)
+    interpretation: str = Field(default="", max_length=1500)
 
 
 class ModelResult(Input):
     judgments: list[Judgment] = Field(max_length=60)
     facts: list[Fact] = Field(default_factory=list, max_length=15)
+    education: EducationResult | None = None

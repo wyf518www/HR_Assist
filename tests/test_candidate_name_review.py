@@ -70,16 +70,16 @@ def test_city_name_blocked_then_human_correction_preserves_data_and_allows_scori
     model = CapturingModel()
     monkeypatch.setattr(service, 'model', lambda: model)
     record = run(service)
-    assert model.calls == 1 and json.loads(record['stats'])['assessed'] == 0
+    assert model.calls == 2 and json.loads(record['stats'])['assessed'] == 0
     detail = service.get_application(application['id'])
     assert detail['name_review_required'] and not detail['name_confirmed']
     assert detail['status'] == 'WAITING_IDENTITY'
     service.review_candidate_name(application['id'], review())
     detail = service.get_application(application['id'])
     assert detail['name'] == 'Alex Example' and detail['name_confirmed'] and not detail['name_review_required']
-    assert model.calls == 1 and detail['assessment'] is None  # Save itself does not call a model.
+    assert model.calls == 2 and detail['assessment'] is None  # Save itself does not call a model.
     record = run(service)
-    assert json.loads(record['stats'])['assessed'] == 1 and model.calls == 2
+    assert json.loads(record['stats'])['assessed'] == 1 and model.calls == 4
     text = dump(model.payload)
     assert 'base Beijing' in text and 'Alex Example' not in text and '姓名已移除' in text
     assessed = service.get_application(application['id'])
@@ -120,9 +120,17 @@ def test_manually_confirmed_identity_skips_extraction_call_budget(service, role,
     model = FakeModel()
     monkeypatch.setattr(service, 'model', lambda: model)
     result = run(service)
-    assert model.calls == 1 and json.loads(result['stats'])['assessed'] == 1
-    assert service.get_application(valid['id'])['assessment']
-    assert not service.db.one("SELECT 1 FROM events WHERE code='MODEL_BUDGET'")
+    assert result['status']=='BLOCKED' and model.calls==1
+    assert json.loads(result['stats'])['assessed']==0
+    assert service.get_application(valid['id'])['assessment'] is None
+    # A one-call budget saves the initial analysis; continuation uses only review.
+    assert service.db.one("SELECT 1 FROM meta WHERE key LIKE 'semantic_draft:%'")
+    result=run(service)
+    assert result['status']=='SUCCESS' and model.calls==2
+    assessment=service.get_application(valid['id'])['assessment']
+    assert assessment and assessment['analysis_cached']
+    assert json.loads(result['stats'])['assessed']==1
+
 
 
 @pytest.mark.parametrize('name', ['', '待确认', ' 张测试', '张测试\n', '<script>', 'a'*81])

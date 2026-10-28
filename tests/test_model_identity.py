@@ -15,7 +15,7 @@ from test_core import configure, FakeModel
 
 
 def answer(name,role,role_id,filename):
-    ref={'span_id':'F1','quote':filename}
+    ref={'span_id':'F1','interpretation':filename}
     return {'name':{'status':'identified','value':name,'evidence':[ref],'note':'原始资料明确记载'},
             'role':{'status':'identified','value':role,'role_id':role_id,'evidence':[ref],'note':'本次应聘岗位对应库内岗位'}}
 
@@ -48,11 +48,11 @@ def test_new_ingest_uses_model_not_filename_rules(service,role,monkeypatch):
     assert result['status']=='SUCCESS',result['error']
     row=service.get_application(app['id'])
     assert row['name']=='王先生' and row['role_id']==role['id'] and row['assessment']['score']==100
-    assert model.calls==2
+    assert model.calls==4
     sources=model.inputs[0]['sources']
     assert any(s['id']=='M1' and '应聘' in s['text'] for s in sources)
     assert service.get_application(app['id'])['identity_complete']
-    assert run(service)['status']=='SUCCESS' and model.calls==2
+    assert run(service)['status']=='SUCCESS' and model.calls==4
     assert service.ingest(make_pdf(),filename)['duplicate']
 
 
@@ -62,11 +62,11 @@ def test_arbitrary_naming_and_name_from_resume_no_rule_fallback(service,role,mon
     configure(service)
     output=answer('Alex Example','Software Developer',role['id'],filename)
     for key in ('name','role'):
-        output[key]['evidence']=[{'span_id':'R1','quote':'Name: Alex Example. Applying Software Developer.'}]
+        output[key]['evidence']=[{'span_id':'R1','interpretation':'Name: Alex Example. Applying Software Developer.'}]
     model=IdentityModel(output);monkeypatch.setattr(service,'model',lambda:model)
     result=run(service)
     assert result['status']=='SUCCESS',result['error']
-    first=dump(model.inputs[0]);score=dump(model.inputs[1])
+    first=dump(model.inputs[0]);score=dump(model.inputs[2])
     assert 'Alex Example' in first and 'Alex Example' not in score
     assert '13812345678' not in first and 'fake@example.invalid' not in first
     assert '姓名已移除' in score
@@ -81,10 +81,10 @@ def test_uncertain_identity_never_calls_scoring_or_guesses(service,role,monkeypa
     result=run(service)
     row=service.get_application(app['id'])
     assert row['status']=='WAITING_IDENTITY' and row['assessment'] is None
-    assert row['name']=='待识别' and row['role_id'] is None and model.calls==1
+    assert row['name']=='待识别' and row['role_id'] is None and model.calls==2
     assert service.identities.proposal(app['id'])
     run(service)
-    assert model.calls==1  # No repeated paid extraction for the same unresolved source.
+    assert model.calls==2  # No repeated paid extraction for the same unresolved source.
 
 
 def test_identity_and_score_share_budget_and_resume_completed_steps(service,role,monkeypatch):
@@ -94,8 +94,11 @@ def test_identity_and_score_share_budget_and_resume_completed_steps(service,role
     settings=service.settings();settings['llm']['max_calls_per_run']=1;service.db.put('settings',settings)
     first=run(service)
     assert first['status']=='BLOCKED' and model.calls==1
+    assert not service.get_application(app['id'])['identity_complete']
+    assert run(service)['status']=='BLOCKED' and model.calls==2
     assert service.get_application(app['id'])['identity_complete']
-    assert run(service)['status']=='SUCCESS' and model.calls==2
+    assert run(service)['status']=='BLOCKED' and model.calls==3
+    assert run(service)['status']=='SUCCESS' and model.calls==4
 
 
 def test_review_preserves_records_until_confirmation_then_keeps_history_and_followup(service,role,monkeypatch):
@@ -116,7 +119,7 @@ def test_review_preserves_records_until_confirmation_then_keeps_history_and_foll
     current=service.get_application(app['id'])
     assert current['id']==app['id'] and current['name']=='王先生' and current['role_id']==role['id']
     assert current['assessment'] is None and len(current['history'])==1 and current['status']=='QUEUED'
-    assert service.db.one('SELECT * FROM followups')==before and model.calls==1
+    assert service.db.one('SELECT * FROM followups')==before and model.calls==2
     assert json.loads(service.db.one('SELECT result FROM assessments')['result'])==old
     assert service.identities.review_rows()[0]['proposal_applied']
     assert '王先生' not in dump(service.db.all('SELECT message FROM events'))
@@ -126,18 +129,18 @@ def test_human_values_are_preserved_during_automatic_processing(service,role,mon
     app=service.ingest(make_pdf(),'【软件工程师_北京】王先生.pdf',role['id'])
     service.review_candidate_name(app['id'],CandidateNameReview(name='已核验姓名',expected_name='待识别',confirmed=True))
     configure(service);model=FakeModel();monkeypatch.setattr(service,'model',lambda:model)
-    assert run(service)['status']=='SUCCESS' and model.calls==1
+    assert run(service)['status']=='SUCCESS' and model.calls==2
     assert service.get_application(app['id'])['name']=='已核验姓名'
 
 
-@pytest.mark.parametrize('case',['fake_name','fake_quote','wrong_role','unknown_span'])
+@pytest.mark.parametrize('case',['unsafe_name','legacy_quote','wrong_role','unknown_span'])
 def test_model_cannot_invent_identity_or_role(case):
     filename='软件工程师 王先生.pdf'
     result=answer('王先生','软件工程师','role1',filename)
-    if case=='fake_name':result['name']['value']='王张三'
-    if case=='fake_quote':result['name']['evidence'][0]={'span_id':'F1','quote':'不存在的引文'}
+    if case=='unsafe_name':result['name']['value']='<unsafe>'
+    if case=='legacy_quote':result['name']['evidence'][0]={'span_id':'F1','quote':'旧契约已不用于新分析'}
     if case=='wrong_role':result['role']['role_id']='not-in-library'
-    if case=='unknown_span':result['name']['evidence'][0]={'span_id':'R9','quote':filename}
+    if case=='unknown_span':result['name']['evidence'][0]={'span_id':'R9','interpretation':filename}
     with pytest.raises(BusinessError):
         validate_identity(result,[{'id':'F1','text':filename,'source':'filename'}],[{'id':'role1','name':'软件工程师'}])
 
@@ -201,9 +204,9 @@ def test_ocr_identity_requires_human_review_and_no_unneeded_model_call(service,r
     service.db.execute('UPDATE documents SET spans=? WHERE file_id=?',(dump([{'id':'R1','page':1,'text':source,'source':'ocr'}]),app['file_id']))
     model=attach_model(service,monkeypatch,role,filename,'测试候选人')
     for key in ('name','role'):
-        model.output[key]['evidence']=[{'span_id':'R1','quote':source}]
+        model.output[key]['evidence']=[{'span_id':'R1','interpretation':source}]
     run(service)
-    assert model.calls==1 and service.get_application(app['id'])['status']=='WAITING_IDENTITY'
+    assert model.calls==2 and service.get_application(app['id'])['status']=='WAITING_IDENTITY'
     p=service.identities.proposal(app['id'])
     assert p['result']['name']['status']=='uncertain' and p['result']['role']['role_id'] is None
 
@@ -224,16 +227,18 @@ def test_bulk_identity_resumes_budget_without_repaying_and_force_is_explicit(ser
     second=service.ingest(make_pdf('Second synthetic resume text.'),filename)
     model=attach_model(service,monkeypatch,role,filename)
     settings=service.settings();settings['llm']['max_calls_per_run']=1;service.db.put('settings',settings)
-    assert run(service,'identity')['status']=='BLOCKED' and model.calls==1
-    assert run(service,'identity')['status']=='SUCCESS' and model.calls==2
+    for expected in (1,2,3):
+        assert run(service,'identity')['status']=='BLOCKED' and model.calls==expected
+    assert run(service,'identity')['status']=='SUCCESS' and model.calls==4
     repeated=run(service,'identity')
-    assert repeated['status']=='SUCCESS' and model.calls==2
+    assert repeated['status']=='SUCCESS' and model.calls==4
     assert json.loads(repeated['stats'])['identity_reused']==2
+    settings['llm']['max_calls_per_run']=2;service.db.put('settings',settings)
     record=service.start_run('identity',uid(),application_ids=[second['id']],force_identity=True)
     service.worker.join(timeout=25)
     assert not service.worker.is_alive()
     assert service.db.one('SELECT status FROM runs WHERE id=?',(record['id'],))['status']=='SUCCESS'
-    assert model.calls==3
+    assert model.calls==6
     for app in (first,second):
         assert service.get_application(app['id'])['name']=='待识别'
         assert service.get_application(app['id'])['assessment'] is None
@@ -260,7 +265,7 @@ def test_same_pdf_and_filename_different_subjects_keep_separate_job_histories(se
             selected=subjects[subject]
             result=answer('王先生',selected['name'],selected['id'],subject)
             for field in ('name','role'):
-                result[field]['evidence']=[{'span_id':'M1','quote':subject}]
+                result[field]['evidence']=[{'span_id':'M1','interpretation':subject}]
             return result,{'total_tokens':10}
     configure(service);model=SubjectModel();monkeypatch.setattr(service,'model',lambda:model)
     first=service.ingest(make_pdf(),'个人简历.pdf',mail_event_id=register_mail(service,'first'),subject='王先生应聘软件工程师')
@@ -277,8 +282,10 @@ def test_same_pdf_and_filename_different_subjects_keep_separate_job_histories(se
     assert service.db.one('SELECT * FROM applications WHERE id=?',(first['id'],))==original
     assert service.db.one('SELECT * FROM followups WHERE application_id=?',(first['id'],))==followup
     assert service.db.one('SELECT * FROM assessments WHERE application_id=?',(first['id'],))==original_score
-    assert model.calls==4 and len(model.identity_inputs)==2
-    assert [s['text'] for s in model.identity_inputs[1]['sources'] if s['id'].startswith('M')]==['王先生应聘系统架构师']
+    # The identical PDF and scoring requirements may reuse the first scoring
+    # analysis; both delivery identities and both reviews remain independent.
+    assert model.calls==7 and len(model.identity_inputs)==4
+    assert [s['text'] for s in model.identity_inputs[2]['sources'] if s['id'].startswith('M')]==['王先生应聘系统架构师']
 
 
 def test_different_names_with_same_pdf_have_distinct_unresolved_applications(service):

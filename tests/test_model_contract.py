@@ -86,7 +86,7 @@ def test_schema_errors_show_position_and_type_without_values(field, value, expec
     assert 'private-' not in error.value.message
 
 
-@pytest.mark.parametrize('evidence', [None, [], [{'span_id': 'R1', 'quote': '本科'}, {'span_id': 'R1', 'quote': '统招'}]])
+@pytest.mark.parametrize('evidence', [None, [], [{'span_id': 'R1', 'interpretation': '本科经历'}, {'span_id': 'R1', 'interpretation': '统招方式'}]])
 def test_fact_evidence_is_never_invented_or_selected_from_multiple(evidence):
     raw, *_ = sample()
     raw['facts'][0]['evidence'] = evidence
@@ -97,7 +97,7 @@ def test_fact_evidence_is_never_invented_or_selected_from_multiple(evidence):
 
 def test_required_citation_parts_and_numbers_remain_strict():
     raw, *_ = sample()
-    raw['judgments'][0]['evidence'] = {'quote': 'private-quote'}
+    raw['judgments'][0]['evidence'] = {'interpretation': 'private-quote'}
     raw['facts'][0]['value'] = 123
     with pytest.raises(BusinessError) as error:
         parse_model_result(raw)
@@ -114,7 +114,7 @@ def test_no_semantic_json_wrappers_or_criterion_arrays_are_guessed():
         assert error.value.code == 'MODEL_SCHEMA' and 'private-' not in error.value.message
 
 
-@pytest.mark.parametrize('target', ['judgments', 'facts', 'evidence', 'reason', 'quote'])
+@pytest.mark.parametrize('target', ['judgments', 'facts', 'evidence', 'reason', 'interpretation'])
 def test_collection_and_text_limits_are_not_truncated(target):
     raw, *_ = sample()
     if target == 'judgments':
@@ -126,7 +126,7 @@ def test_collection_and_text_limits_are_not_truncated(target):
     elif target == 'reason':
         raw['judgments'][0][target] = 'X' * 1501
     else:
-        raw['judgments'][0]['evidence'][0]['quote'] = 'X' * 5001
+        raw['judgments'][0]['evidence'][0]['interpretation'] = 'X' * 5001
     with pytest.raises(BusinessError) as error:
         parse_model_result(raw)
     assert '超过长度限制' in error.value.message and 'X' * 10 not in error.value.message
@@ -155,15 +155,15 @@ def test_output_compatibility_does_not_relax_http_input_schemas():
     schema = output_schema()
     assert schema['additionalProperties'] is False
     assert schema['$defs']['Judgment']['properties']['evidence']['type'] == 'array'
-    assert schema['$defs']['Fact']['properties']['evidence']['$ref'].endswith('/Evidence')
+    assert schema['$defs']['Fact']['properties']['evidence']['$ref'].endswith('/SemanticReference')
 
 
-def test_compatible_shape_does_not_bypass_fabricated_citation():
+def test_compatible_shape_does_not_bypass_unknown_source_id():
     raw, spans, criteria, policy = sample()
-    raw['judgments'][0].update(verdict='满足', evidence={'span_id': 'R1', 'quote': '虚构的内容'}, score=100)
+    raw['judgments'][0].update(verdict='满足', evidence={'span_id': 'private-source-id', 'interpretation': '模型的语义解释'}, score=100)
     with pytest.raises(BusinessError) as error:
         validate_and_score(raw, spans, criteria, policy, False)
-    assert error.value.code == 'EVIDENCE_INVALID'
+    assert error.value.code == 'EVIDENCE_SOURCE_INVALID'
 
 
 def test_contract_prompt_cache_version(monkeypatch):
@@ -192,13 +192,13 @@ def test_schema_failure_diagnosis_then_compatible_retry_preserves_data(service, 
     before = service.db.one('SELECT * FROM followups WHERE application_id=?', (application['id'],))
     original = service.storage.file(application['file_id'])[1].read_bytes()
     failed = run(service)
-    assert model.calls == 1 and json.loads(failed['stats'])['assessed'] == 0
+    assert model.calls == 2 and json.loads(failed['stats'])['assessed'] == 0
     assert service.get_application(application['id'])['assessment'] is None
     event = service.db.one("SELECT message FROM events WHERE code='MODEL_SCHEMA'")
     assert 'judgments[1].reason：应为文本' in event['message'] and 'private-' not in event['message']
     model.compatible = True
     success = run(service)
-    assert success['status'] == 'SUCCESS' and model.calls == 2
+    assert success['status'] == 'SUCCESS' and model.calls == 3
     assert json.loads(success['stats'])['archived'] == 0
     assert json.loads(success['stats'])['exceptions'] == 0
     assert len(service.db.all('SELECT * FROM applications')) == 1
@@ -210,4 +210,24 @@ def test_schema_failure_diagnosis_then_compatible_retry_preserves_data(service, 
     assert 'MODEL_FORMAT_NORMALIZED' in logs and 'private-' not in logs
     assert service.storage.file(application['file_id'])[1].read_bytes() == original
     assert service.db.one('SELECT * FROM followups WHERE application_id=?', (application['id'],)) == before
-    assert run(service)['status'] == 'SUCCESS' and model.calls == 2
+    assert run(service)['status'] == 'SUCCESS' and model.calls == 3
+
+
+def test_model_quote_is_ignored_and_source_text_is_bound_by_server():
+    raw,spans,criteria,policy=sample()
+    ref=raw['judgments'][0]['evidence'][0]
+    ref['quote']='模型伪装成原文的文字'
+    result=validate_and_score(raw,spans,criteria,policy,False)
+    assert result['items'][0]['evidence'][0]['quote']==spans[0]['text']
+    assert '模型伪装成原文的文字' not in dump(result)
+
+
+def test_new_schema_uses_semantic_references_and_typed_education():
+    schema=output_schema()
+    reference=schema['$defs']['SemanticReference']
+    assert set(reference['properties'])=={'span_id','interpretation'}
+    assert reference['additionalProperties'] is False
+    education=schema['$defs']['EducationResult']['properties']
+    assert set(education['degree']['enum'])=={'bachelor','master','doctor','other','unknown'}
+    assert set(education['completion']['enum'])=={'attained','in_progress','unknown'}
+    assert set(education['admission']['enum'])=={'national_regular','non_regular','unknown'}

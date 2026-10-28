@@ -1,6 +1,11 @@
 'use strict';
 const jdUI={items:[],review:null,uploading:false,uploads:[],polling:false,analyzingText:false};
 const jdStates={QUEUED:'排队中',EXTRACTING:'读取原文',ANALYZING:'模型解析中',READY:'待核对',FAILED:'解析失败',INTERRUPTED:'中断待重试',SAVED:'已保存',ROLE_DELETED:'关联岗位已删除'};
+function jdReference(ref){
+  const source=`${ref.span_id}${ref.page?' · 第'+ref.page+'页':''}${ref.source==='ocr'?' · OCR':''}`;
+  if(ref.semantic===true)return `<div class="jd-source-reference"><p><b>模型解读：</b>${E(ref.interpretation)}</p><details><summary>查看对应原文 · ${E(source)}</summary><blockquote>${E(ref.quote)}</blockquote></details></div>`;
+  return `<blockquote><small>${E(source)} · 历史引文</small>${E(ref.quote)}</blockquote>`;
+}
 
 function confirmRoleAction(role,action){
   const deleting=action==='delete-role',enabling=action==='enable-role';
@@ -41,7 +46,7 @@ function confirmJDTextOverwrite(){
     dialog.setAttribute('aria-labelledby','jd-overwrite-title');
     dialog.setAttribute('aria-describedby','jd-overwrite-description');
     dialog.innerHTML=`<h2 id="jd-overwrite-title">智能分析将覆盖已填写内容</h2>
-      <div id="jd-overwrite-description"><p>将调用已批准的模型，根据当前 JD 原文重新填入：岗位名称、学历、经验年限、地点、证书、岗位职责、核心技能和到岗时间备注。</p>
+      <div id="jd-overwrite-description"><p>将调用已批准的模型，根据当前 JD 原文分析并复核，再重新填入：岗位名称、学历、经验年限、地点、证书、岗位职责、核心技能和到岗时间备注。每份新分析通常调用两次；已有分析草稿时继续复核。</p>
       <p><b>未在原文中识别到的项目会清空。</b>分析成功后会取消“已核对”勾选，需要重新确认。</p>
       <p>JD 原文、销售岗位标记和评分权重保持不变。仅回填当前表单，点击“保存 JD 版本”后才会保存。</p></div>
       <div class="actions"><button type="button" class="button" data-jd-dialog="cancel" autofocus>取消</button><button type="button" class="button primary" data-jd-dialog="confirm">确认覆盖并分析</button></div>`;
@@ -99,7 +104,7 @@ async function analyzeJDText(button){
     status.textContent='已回填，尚未保存。'+(draft.missing.length?'缺失项：'+draft.missing.join('、')+'。':'')+(draft.warnings||[]).join(' ');
     const evidence=form.querySelector('#jd-analysis-evidence');
     evidence.hidden=false;
-    evidence.innerHTML=`<summary>查看本次智能分析的原文依据</summary><p class="form-help">${E(result.model)} · 请核对各项引文与填写内容。默认评分说明会在保存时随要求更新，自定义细则请自行核对。</p>${Object.entries({name:'岗位名称',...fieldLabels}).map(([key,label])=>`<div class="jd-evidence"><b>${E(label)}</b>${(draft.evidence[key]||[]).map(ref=>`<blockquote>${E(ref.quote)}</blockquote>`).join('')||`<p class="form-help">${['availability','location'].includes(key)?'原文未提及，可留空。':'原文未找到依据，已留空。'}</p>`}</div>`).join('')}`;
+    evidence.innerHTML=`<summary>查看本次模型解读与原始来源</summary><p class="form-help">${E(result.model)} · 已由模型分析并复核，请核对语义解读与对应原文。默认评分说明会在保存时随要求更新，自定义细则请自行核对。</p>${Object.entries({name:'岗位名称',...fieldLabels}).map(([key,label])=>`<div class="jd-evidence"><b>${E(label)}</b>${(draft.evidence[key]||[]).map(jdReference).join('')||`<p class="form-help">${['availability','location'].includes(key)?'原文未提及，可留空。':'原文未找到依据，已留空。'}</p>`}</div>`).join('')}`;
     toast('智能分析完成，请核对填入内容后保存 JD 版本。');
   }catch(error){
     if(form.isConnected){status.classList.add('jd-error');status.textContent='分析失败：'+errorText(error)+' 已填写内容保持不变。';form.querySelector('[role=alert]').textContent=errorText(error);}
@@ -120,7 +125,7 @@ async function jdImportsPage(){
     <section class="panel panel-body jd-upload-panel"><form id="jd-import-form" class="form-stack">
       <label class="live-field">选择岗位文件（可多选）<input name="files" type="file" accept=".pdf,.docx,.txt" multiple required ${jdUI.uploading?'disabled':''}></label>
       <div class="status-inline"><p class="form-help">支持 PDF、DOCX、UTF-8 TXT。每批最多20份，每份不超过20MB。扫描 PDF 自动尝试 OCR。</p><button class="button primary" type="submit" ${!ready||jdUI.uploading?'disabled':''}>上传并智能解析</button></div>
-      <p class="form-help">使用“连接与设置”中批准的模型，每份新文件调用一次；重试需手动触发。同一文件再次上传会复用导入记录。</p>
+      <p class="form-help">使用“连接与设置”中批准的模型，每份新分析通常调用两次，先分析再复核；已有分析草稿时继续复核，重试需手动触发。同一文件再次上传会复用导入记录。</p>
       <div id="jd-upload-results" role="status" aria-live="polite">${jdUploadResults()}</div>
       <div class="error-message" role="alert"></div>
     </form></section>
@@ -148,7 +153,7 @@ function jdEvidence(key){
   const refs=jdUI.review?.draft?.evidence?.[key]||[];
   if(!refs.length&&['availability','location'].includes(key))return '<p class="form-help">可留空，不参与评分。</p>';
   if(!refs.length)return '<p class="jd-missing">未提取到有原文依据的内容，请核对补充。</p>';
-  return `<details class="jd-evidence"><summary>查看原文依据（${refs.length}处）</summary>${refs.map(ref=>`<blockquote><small>${E(ref.span_id)}${ref.page?' · 第'+E(ref.page)+'页':''}${ref.source==='ocr'?' · OCR':''}</small>${E(ref.quote)}</blockquote>`).join('')}</details>`;
+  return `<details class="jd-evidence"><summary>查看分析与来源（${refs.length}处）</summary>${refs.map(jdReference).join('')}</details>`;
 }
 
 function jdReviewPage(){
@@ -166,7 +171,7 @@ function jdReviewPage(){
       <div>${liveField('岗位名称','name',draft.name||'','text','required maxlength="60"')}${jdEvidence('name')}</div>
       ${check('我确认这是销售岗位，不适用全局本科院校门槛','is_sales',false)}
       <div class="form-grid">${Object.entries(fieldLabels).map(([key,label])=>`<div>${textarea(label,key,fields[key]||'',`maxlength="${['responsibilities','skills'].includes(key)?5000:2000}" rows="3"`)}${jdEvidence(key)}</div>`).join('')}</div>
-      <p class="form-help">提取内容为原文引句，可以在此修订。未提及的条件保留空白；只有你确认该条件不受限制时才填写“不限”。工作地点/base地和到岗时间仅作可选备注，不参与评分。销售岗位须由你确认。</p>
+      <p class="form-help">${draft.evidence_mode==='model_semantic_review'?'填写内容为大模型分析并复核后的语义整理，模型解读与对应原文分开展示。':'这是历史提取结果，原有引文与填写内容保留。'}可以在此核对修订。未提及的条件保留空白；只有你确认该条件不受限制时才填写“不限”。工作地点/base地和到岗时间仅作可选备注，不参与评分。销售岗位须由你确认。</p>
       ${check('我已逐项核对提取结果和原文；补充内容代表本岗位的实际要求','reviewed',false)}
       ${check('要求完整，批准本版 JD 用于简历评估（未勾选则保存草稿）','approved',false)}
       <div class="actions"><button class="button primary" type="submit">保存岗位 JD</button>${btn('返回导入列表','jd-back')}</div><div class="error-message" role="alert"></div>
