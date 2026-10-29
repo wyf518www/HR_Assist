@@ -11,6 +11,7 @@ import threading
 import time
 
 from .assessment import MODEL_CALL_ERRORS, CloudModel, assess, assessment_key, default_criteria, missing_jd_fields, name_looks_like_location, scoring_criteria, validate_redaction_name
+from .assessment_explanations import decision_reasons
 from .model_contract import format_adjustment_message
 from .config import DEFAULT_SETTINGS
 from .db import Database, dump, now, uid
@@ -278,6 +279,10 @@ class Service:
         row=rows[0] if rows else None
         if not row:
             raise BusinessError("APPLICATION_NOT_FOUND","申请不存在。",404)
+        if row.get('assessment'):
+            # Explain the stored decision without changing its historical score,
+            # policy result or manually maintained follow-up information.
+            row['assessment']['decision_reasons']=decision_reasons(row['assessment'])
         document=self.db.one("SELECT * FROM documents WHERE file_id=?",(row["file_id"],))
         row["document"]={**document,"spans":json.loads(document["spans"])} if document else None
         row["name_confirmed"]=self.name_is_confirmed(row)

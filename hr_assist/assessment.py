@@ -14,12 +14,13 @@ from .semantic import bind_references, two_pass
 from .model_contract import ASSESSMENT_OUTPUT_INSTRUCTIONS, output_schema, parse_model_result
 from .model_options import generation_profile, request_options
 from .storage import BusinessError
+from .assessment_explanations import ADMISSION_POLICY_VERSION, decision_reasons, education_ocr, score_grade
 
 DIMENSIONS = {"hard":20,"skills":30,"experience":30,"achievements":10,"stability":10}
 FIELD_LABELS = {"education":"学历","experience":"经验年限","location":"地点","certificates":"证书","availability":"到岗时间","responsibilities":"岗位职责","skills":"核心技能"}
 REQUIRED_JD_FIELDS = tuple(key for key in FIELD_LABELS if key not in {"availability", "location"})
 FACT_LABELS = {"company":"当前公司", "education_level":"学历", "admission":"招生方式", "institution":"毕业院校", "experience":"工作年限"}
-ASSESSMENT_PROMPT_VERSION = "v8-semantic-review"
+ASSESSMENT_PROMPT_VERSION = "v9-admission-default"
 DIMENSION_LABELS = {"hard":"硬性条件", "skills":"核心技能", "experience":"工作经验", "achievements":"项目成果", "stability":"稳定性"}
 
 
@@ -388,6 +389,8 @@ def validate_and_score(raw, spans, criteria, policy, is_sales):
                     "message":f"{label}未附简历来源依据；已撤销模型结论，改为未知、暂计0分，评估结果为待定，请人工核验。"})
         if criterion["hard"] and any(ref.get("source")=="ocr" for ref in evidence):
             verdict="unknown"
+            reason=f"{label}的硬性条件依据包含 OCR 文字，须对照原件人工核验，暂计0分；原模型判定不作为已确认结论。"
+            question="请对照原始 PDF 核验该条目涉及的识别文字，再重新评估。"
         if verdict=="unknown" or (criterion["hard"] and verdict=="partial"):
             uncertain=True
         if criterion["hard"] and verdict=="not_met":
@@ -409,38 +412,48 @@ def validate_and_score(raw, spans, criteria, policy, is_sales):
             raise BusinessError('EDUCATION_CATALOG_INVALID','模型选择的院校目录项无效或与匹配状态冲突；未生成评分，请手动重试。',
                                 diagnostics={'validation_kind':'fact_value','fact_field':'institution'})
         education['catalog_name']=catalog[school_id]['name'] if school_id in catalog else None
+        # An unstated admission mode is a policy default, never a confirmed
+        # factual claim of national admission. Keep source references for OCR
+        # checks/audit, but do not display a contradictory free-text fact.
+        if education['admission']=='not_stated':
+            facts.pop('admission',None)
+            fact_duplicate_counts.pop('admission',None)
     education_gate="pass"
     gate_reason="销售岗位不适用全局院校门槛；其 JD 条件仍单独评估。"
+    education_sources={'education':education,'fact_refs':fact_refs,'fact_evidence_refs':fact_evidence_refs}
+    needs_ocr_review=education_ocr(education_sources)
+    if education:
+        education['admission_defaulted']=bool(not is_sales and education['degree']=='bachelor'
+            and education['completion']=='attained' and education['admission']=='not_stated'
+            and education['evidence'] and not needs_ocr_review)
     if not is_sales:
         education_gate="unknown"
-        gate_reason="学历事实尚未明确，需要人工确认；不从自由文本或院校名称片段推断。"
-        if education and education['evidence']:
-            if any(ref.get('source')=='ocr' for ref in education['evidence']):
-                gate_reason="学历依据来自 OCR，须对照原件人工核验。"
-            elif education['completion']!='attained':
-                gate_reason="未明确已取得学历；在读或取得状态不明，待人工核验。"
-            elif education['degree']=='master' and policy.get('master_bypass'):
+        gate_reason="学历或策略组合尚未明确覆盖，待人工核验；不自动扩大用户确认的放宽规则。"
+        if education and education['evidence'] and not needs_ocr_review and education['completion']=='attained':
+            if education['degree']=='master' and policy.get('master_bypass'):
                 education_gate='pass'
                 gate_reason="模型复核为已取得硕士学历，按用户确认策略放宽院校要求。"
             elif education['degree']=='bachelor':
                 if education['admission']=='non_regular' or education['institution_match']=='not_in_catalog':
                     education_gate='fail'
-                elif education['admission']=='national_regular' and education['institution_match']=='catalog':
+                elif education['admission'] in {'national_regular','not_stated'} and education['institution_match']=='catalog':
                     education_gate='pass'
-                gate_reason="依据模型复核的同一教育经历：本科须为统招，且院校对应用户已确认名录；不将全日制等同统招。"
-            else:
-                gate_reason="该学历或策略组合尚未明确覆盖，待人工核验；不自动扩大用户确认的放宽规则。"
-        if any(ref.get('source')=='ocr' for key,refs in fact_evidence_refs.items()
-               if key in {'education_level','admission','institution'} for ref in refs):
-            education_gate='unknown'
-            gate_reason="学历相关事实包含 OCR 来源，须对照原件人工核验。"
+                    gate_reason=("已取得本科且院校匹配已核验名录；招生方式未注明且无明确特殊说明，按当前策略默认通过该子条件，不据此认定事实为统招。"
+                                 if education['admission']=='not_stated' else
+                                 "同一已取得本科经历具有明确统招依据，且院校匹配用户已核验名录，学历门槛通过。")
+        if education_gate!='pass':
+            explanations=decision_reasons({**education_sources,'policy_version':ADMISSION_POLICY_VERSION,
+                                           'education_gate':education_gate,'gate_reason':gate_reason})
+            gate_reason='；'.join(item['detail'] for item in explanations)
     hard_fail=hard_fail or education_gate=="fail"
     uncertain=uncertain or education_gate=="unknown"
     total=sum(scores.values())
-    grade="强烈推荐" if total>=85 else "推荐" if total>=70 else "待定" if total>=60 else "不推荐"
+    base_grade=score_grade(total)
+    grade=base_grade
     if uncertain or (hard_fail and total>=70):
         grade="待定"
-    return {"score":total,"scores":scores,"grade":grade,"provisional":uncertain,"hard_fail":hard_fail,
+    output={"score":total,"scores":scores,"grade":grade,"provisional":uncertain,"hard_fail":hard_fail,
+            "base_grade":base_grade,"grade_limited":grade!=base_grade,"policy_version":ADMISSION_POLICY_VERSION,
             "education_gate":education_gate,"gate_reason":gate_reason,"education":education,
             "facts":facts,"fact_refs":fact_refs,"items":items,
             "fact_evidence_refs":fact_evidence_refs,"fact_duplicate_counts":fact_duplicate_counts,
@@ -448,6 +461,8 @@ def validate_and_score(raw, spans, criteria, policy, is_sales):
             "evidence_mode":"model_semantic_review",
             "advantages":[i["reason"] for i in items if i["verdict"]=="met" and i["evidence"]],
             "risks":[i["reason"] for i in items if i["verdict"]!="met"]}
+    output['decision_reasons']=decision_reasons(output)
+    return output
 
 
 def assess(model, application, jd, spans, policy, *, db=None, reserve=None):
@@ -473,7 +488,14 @@ def assess(model, application, jd, spans, policy, *, db=None, reserve=None):
             "education_level、institution、admission描述同一最高已取得教育经历，不能拼凑不同学校或学位；未知事实省略。"
             "education独立返回同一教育经历的typed分类和来源；不能依赖自由文本事实代替它。"
             "degree为bachelor/master/doctor/other/unknown；completion为attained/in_progress/unknown。在读、计划攻读不算已取得。"
-            "admission为national_regular/non_regular/unknown；仅全日制不能确定统招；不明确就unknown。"
+            "admission为national_regular/not_stated/non_regular/unknown。national_regular只用于同一本科经历明确写明统招；"
+            "not_stated用于未说明招生方式，或仅写全日制且没有非全日制、成人、自考、函授等明确特殊说明；"
+            "non_regular用于同一本科经历明确存在这些特殊说明，不能把另一段教育经历的说明套用到本段；"
+            "unknown仅用于资料矛盾，或无法确认相关说明属于哪段教育经历，不用于单纯未注明。"
+            "按education_policy.admission_not_stated_pass已确认策略，not_stated默认通过本科招生方式这一子条件。"
+            "此策略同时适用于全局本科门槛及JD学历评分条目，不能仅因未写统招而在JD学历条目判unknown、partial、扣分或要求补证。"
+            "学历层次、是否已取得、专业、院校等其他要求仍独立核验，不得因招生方式默认通过而全部豁免。"
+            "默认通过不是事实统招：not_stated时不返回facts中的admission项，不将全日制等同统招，不编造招生方式。"
             "institution_match为catalog/not_in_catalog/unknown：可按语义识别学校正式名称、简称和更名，但不得把独立学院、合作办学或不明校区硬配到名录。"
             "catalog_id只能从education_policy.catalog中选择；不在目录或不确定时为null，不能自行认定985/211。"
             "education的interpretation解释这些分类是否来自同一经历；来源缺失或冲突必须说明未知，不用confidence代替依据。"
@@ -481,6 +503,8 @@ def assess(model, application, jd, spans, policy, *, db=None, reserve=None):
     payload={"criteria":criteria,"resume_spans":safe_spans,"output_schema":output_schema(),
              "education_policy":{"is_sales":bool(application['is_sales']),"master_bypass":bool(policy.get('master_bypass')),
                                  "catalog":education_catalog(policy),"school_source":policy.get('school_source',''),
+                                 "admission_policy":ADMISSION_POLICY_VERSION,"admission_not_stated_pass":True,
+                                 "admission_default_value":"not_stated",
                                  "doctor_policy":"not_covered"}}
     raw,meta=two_pass(model,system,payload,task="assessment",db=db,reserve=reserve)
     result=validate_and_score(raw,safe_spans,criteria,policy,bool(application["is_sales"]))

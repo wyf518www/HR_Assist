@@ -238,7 +238,7 @@ class EducationResult(Input):
     # or degrees. Semantic interpretation is model-reviewed; policy is local.
     degree: Literal["bachelor", "master", "doctor", "other", "unknown"]
     completion: Literal["attained", "in_progress", "unknown"]
-    admission: Literal["national_regular", "non_regular", "unknown"]
+    admission: Literal["national_regular", "not_stated", "non_regular", "unknown"]
     institution_match: Literal["catalog", "not_in_catalog", "unknown"]
     catalog_id: str | None = Field(default=None, max_length=100)
     evidence: list[SemanticReference] = Field(default_factory=list, max_length=12)

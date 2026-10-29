@@ -113,7 +113,10 @@ def test_review_preserves_records_until_confirmation_then_keeps_history_and_foll
     batch=run(service,'identity')
     assert batch['status']=='SUCCESS'
     current=service.get_application(app['id'])
-    assert current['name']=='北京' and current['role_id']==wrong['id'] and current['assessment']==old
+    assert current['name']=='北京' and current['role_id']==wrong['id']
+    assert {k:v for k,v in current['assessment'].items() if k!='decision_reasons'}==old
+    assert current['assessment']['decision_reasons'][0]['code']=='SCORE_BAND_HOLD'
+    assert json.loads(service.db.one('SELECT result FROM assessments')['result'])==old
     p=service.identities.proposal(app['id'])
     service.identities.apply([dict(application_id=app['id'],proposal_id=p['id'],name='王先生',role_id=role['id'])])
     current=service.get_application(app['id'])

@@ -230,4 +230,4 @@ def test_new_schema_uses_semantic_references_and_typed_education():
     education=schema['$defs']['EducationResult']['properties']
     assert set(education['degree']['enum'])=={'bachelor','master','doctor','other','unknown'}
     assert set(education['completion']['enum'])=={'attained','in_progress','unknown'}
-    assert set(education['admission']['enum'])=={'national_regular','non_regular','unknown'}
+    assert set(education['admission']['enum'])=={'national_regular','not_stated','non_regular','unknown'}

@@ -124,7 +124,7 @@ def test_only_second_pass_result_is_scored_and_sources_remain_whole():
     assert len(calls)==2 and model.calls[1]['analysis_result']==first
     assert model.calls[0]['resume_spans']==spans==model.calls[1]['resume_spans']
     assert result['usage']=={'total_tokens':14} and not result['analysis_cached']
-    assert result['evidence_mode']=='model_semantic_review' and result['prompt_version']=='v8-semantic-review'
+    assert result['evidence_mode']=='model_semantic_review' and result['prompt_version']=='v9-admission-default'
 
 
 def test_review_failure_never_scores_unreviewed_first_result():

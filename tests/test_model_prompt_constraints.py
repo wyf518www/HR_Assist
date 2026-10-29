@@ -39,7 +39,7 @@ def test_assessment_sends_final_output_constraints_without_truncating_sources():
     assert payload['resume_spans'] == original == spans
     assert [item['id'] for item in payload['criteria']] == [item['id'] for item in criteria]
     assert len(result['items']) == len(criteria)
-    assert result['prompt_version'] == 'v8-semantic-review'
+    assert result['prompt_version'] == 'v9-admission-default'
     assert len(model.calls)==2 and model.calls[1][1]['task_stage']=='semantic_review'
 
 

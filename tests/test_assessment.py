@@ -57,8 +57,12 @@ def test_full_time_does_not_claim_unified_admission():
     for fact in raw['facts']:
         fact['evidence']={'span_id':'R1','interpretation':'只确定全日制，不能据此判定统招'}
         if fact['field']=='admission':fact['value']='全日制'
-    raw['education']['admission']='unknown'
-    assert validate_and_score(raw,spans,criteria,policy,False)['education_gate']=='unknown'
+    raw['education']['admission']='not_stated'
+    assessed=validate_and_score(raw,spans,criteria,policy,False)
+    assert assessed['education_gate']=='pass'
+    assert assessed['education']['admission']=='not_stated'
+    assert assessed['education']['admission_defaulted']
+    assert 'admission' not in assessed['facts']
 
 
 def test_cloud_contract_and_sanitized_errors(monkeypatch):

@@ -61,7 +61,10 @@ def test_legacy_migration_preserves_jd_assessment_and_manual_cells(service,role_
     current=service.roles()[0]
     assert current['current_version']!=old and current['approved'] and not current['missing']
     assert json.loads(service.db.one('SELECT criteria FROM jd_versions WHERE id=?',(old,))['criteria'])==criteria
-    assert service.get_application(application['id'])['assessment']==result
+    assessment=service.get_application(application['id'])['assessment']
+    assert {key:value for key,value in assessment.items() if key!='decision_reasons'}==result
+    assert assessment['decision_reasons'][0]['code']=='SCORE_BAND_HOLD'
+    assert json.loads(service.db.one('SELECT result FROM assessments WHERE id=?',(aid,))['result'])==result
     assert service.db.one('SELECT * FROM followups')==manual
 
 

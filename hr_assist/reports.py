@@ -9,6 +9,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
+from .assessment_explanations import decision_reasons
 from .db import dump, now, uid
 from .storage import BusinessError, validate_zip
 
@@ -309,6 +310,13 @@ def overview_export(db, storage):
     sheet.append([*OVERVIEW_COLUMNS,"_application_id"])
     for index,row in enumerate(rows,2):
         result=row["assessment"] or {}
+        reasons=decision_reasons(result) if result else []
+        risks=list(result.get('risks',[]))
+        risks.extend(f"{reason['title']}：{reason['detail']}" for reason in reasons)
+        risks=list(dict.fromkeys(risks))
+        actions=[f"{reason['title']}：{reason['action']}" for reason in reasons if reason.get('action')]
+        grade_note=(f"按分数建议等级：{result['base_grade']}。"+
+                    (f"因所列条件，最终等级调整为{result['grade']}。" if result.get('grade_limited') else '')) if result.get('base_grade') else ''
         refs=[]
         for item in result.get("items",[]):
             citations="、".join(e["span_id"] for e in item["evidence"])
@@ -317,8 +325,9 @@ def overview_export(db, storage):
         facts=result.get("facts",{})
         values=[row["role_name"] or "待分类",row["recommended_at"] or "",row["name"],result.get("score"),result.get("grade",""),
                 facts.get("company",""),facts.get("experience",""),"；".join(result.get("advantages",[])),
-                "；".join(result.get("risks",[])) or ("JD缺失项：岗位要求未补齐或尚未确认，停止评估" if row["status"]=="WAITING_JD" else row["status"] if not result else result.get("gate_reason","")),
-                ("暂计分；存在未知信息，请人工核验。\n" if result.get("provisional") else "")+("\n".join(refs) or ("请查看逐项要求与待核验信息。" if result else "尚未评估，请在工作台处理待办。"))]
+                "；".join(risks) or ("JD缺失项：岗位要求未补齐或尚未确认，停止评估" if row["status"]=="WAITING_JD" else row["status"] if not result else result.get("gate_reason","")),
+                "\n".join(part for part in [grade_note,*actions,"暂计分；存在未知信息，请人工核验。" if result.get("provisional") else '',
+                    "\n".join(refs) or ("请查看逐项要求与待核验信息。" if result else "尚未评估，请在工作台处理待办。")] if part)]
         for column,value in enumerate(values,1):
             if column==4:
                 sheet.cell(index,column,value)
@@ -376,7 +385,16 @@ def role_reports(db, storage, run_id):
                 items.append(f"<tr><td>{escape(item['description'])}</td><td>{verdict}</td><td>{item['awarded']}/{item['points']}</td><td>{escape(item['reason'])}<br>{quotes}</td></tr>")
             provisional="<p><b>暂计分；存在未知信息，请人工核验。缺少证据不等于不满足要求。</b></p>" if result.get("provisional") else ""
             review="<p>分析与语义复核均由模型完成；模型解读与服务器保存的原文分开展示，结论仍供人工核验。</p>" if result.get('evidence_mode')=='model_semantic_review' else ''
-            sections.append(f"<section><h2>{escape(row['name'])} · {result['score']}/100 · {escape(result['grade'])}</h2>{provisional}{review}<p>{escape(result['gate_reason'])}</p><p>记录 {row['id']} / JD {escape(result.get('jd_version_id',''))}</p><table><tr><th>要求</th><th>判定</th><th>分数</th><th>依据</th></tr>{''.join(items)}</table></section>")
+            reasons=decision_reasons(result)
+            explanation=''
+            if reasons or result.get('grade')=='待定' or result.get('grade_limited'):
+                title='为何待定' if result.get('grade')=='待定' else '推荐等级说明'
+                summary=(f"<p>按分数建议等级：<b>{escape(result['base_grade'])}</b>。"+
+                         (f"因下列条件，最终等级调整为<b>{escape(result['grade'])}</b>。" if result.get('grade_limited') else '')+'</p>') if result.get('base_grade') else ''
+                details=''.join(f"<article><h4>{escape(reason['title'])}</h4><p>{escape(reason['detail'])}</p>"+
+                                (f"<p><b>建议处理：</b>{escape(reason['action'])}</p>" if reason.get('action') else '')+'</article>' for reason in reasons)
+                explanation=f"<div class='decision'><h3>{title}</h3>{summary}{details or '<p>旧评估未记录具体原因，请查看逐项依据；需要采用当前规则时，可申请重新评估。</p>'}</div>"
+            sections.append(f"<section><h2>{escape(row['name'])} · {result['score']}/100 · {escape(result['grade'])}</h2>{provisional}{explanation}{review}<p>{escape(result['gate_reason'])}</p><p>记录 {row['id']} / JD {escape(result.get('jd_version_id',''))}</p><table><tr><th>要求</th><th>判定</th><th>分数</th><th>依据</th></tr>{''.join(items)}</table></section>")
         document=f"<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>{escape(role)}推荐报告</title><style>body{{max-width:1100px;margin:40px auto;padding:20px;font:15px/1.8 sans-serif;color:#183443}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccd7dc;padding:12px;text-align:left}}section{{margin-top:35px}}</style><h1>{escape(role)}推荐报告</h1><p>生成时间：{now()} / 批次：{run_id}。建议供人工核验，不自动淘汰或录用。</p>{''.join(sections)}</html>"
         files.append(storage.put(document.encode(),f"{role}_推荐报告.html","reports"))
     return files

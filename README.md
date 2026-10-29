@@ -13,6 +13,7 @@
 - QQ IMAP TLS 只读收件箱、主题过滤、增量窗口、去重；北京时间每日 09:00 计划默认关闭。
 - PDF 文本解析、中英文 OCR；扫描文字可对照原件核验，核验后保留版本并重新评估。
 - 公司批准的 JSON 对话模型接口负责姓名岗位识别、JD 提取及逐项评分的语义判断，每项任务经过分析与第二次模型复核。程序校验结构、来源编号和已确认的规则，并计算 20/30/30/10/10 分值，不要求模型解释或规范化事实值与原文逐字相同。缺证据显示暂计分、待定，JD 不完整则不评估。
+- 本科未注明招生方式、且没有明确非全日制等例外说明时，按已确认规则默认通过招生方式这一项；不会把未说明登记为已核实统招。模型按同一教育经历识别明确例外和冲突，院校名录、学历取得状态等条件仍独立判断。详情、Excel和岗位报告逐项解释为何待定及后续核验事项，历史评分保留原政策，需明确申请重新评估才采用新规则。
 - 网页与“人工跟进.xlsx”共用七个人工跟进字段；Excel 按导出基准逐字段合并，冲突整批拒绝。生成“招聘推荐总览.xlsx”（17列 + 证据表）与岗位 HTML 报告。
 - 候选人库支持多选后批量跟进：只改勾选字段，先预览人员和覆盖内容再确认；支持明确清空，任一记录版本冲突则整批不写入。
 - 候选人库支持组合筛选姓名/岗位/附件名、岗位、处理状态、推荐等级、匹配度区间和面试跟进；可按匹配度、处理状态、推荐日期、入库时间或约面时间双向排序。未评估不等于0分，空值始终置底。每页50/100/200/500人，批量跟进只选择本页，筛选、排序和翻页会清空选择。
@@ -52,7 +53,7 @@ $env:HR_SCHEDULER = 'false'
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
 node --check hr_assist/web/app.js
-node --test tests/test_page_navigation.js tests/test_model_settings.js tests/test_candidate_query.js tests/test_candidate_list.js tests/test_diagnostic_reasons.js tests/test_semantic_assessment_ui.js tests/test_semantic_source_ui.js
+node --test tests/test_page_navigation.js tests/test_model_settings.js tests/test_candidate_query.js tests/test_candidate_list.js tests/test_diagnostic_reasons.js tests/test_semantic_assessment_ui.js tests/test_semantic_source_ui.js tests/test_decision_explanations_ui.js
 ```
 
 CI 在 Linux 上运行测试、构建镜像，并验证容器登录、扫描 PDF OCR 和重启后数据保留。实际检查结果见 [第一版实施与验收](docs/第一版实施与验收.md)。
