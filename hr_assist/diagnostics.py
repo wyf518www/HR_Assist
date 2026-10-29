@@ -70,10 +70,11 @@ cached_tokens input_tokens output_tokens attempt retry_count item_count candidat
 # In particular, do not accept custom JD ids, fact values, quotes or span ids.
 REASON_ENUMS = {
     "model_step": frozenset({"analysis", "review"}),
-    "validation_kind": frozenset({"score_evidence", "fact_evidence", "fact_value", "identity_schema"}),
+    "validation_kind": frozenset({"score_evidence", "fact_evidence", "fact_value", "identity_schema", "score_schema"}),
     "evidence_reason": frozenset({"span_missing", "empty_quote", "no_match", "ambiguous_match", "value_missing"}),
     "criterion_dimension": frozenset({"hard", "skills", "experience", "achievements", "stability"}),
     "fact_field": frozenset({"company", "education_level", "admission", "institution", "experience"}),
+    "education_catalog_reason": frozenset({"catalog_id_missing", "catalog_id_unknown", "status_id_conflict"}),
     "identity_reason": frozenset({"name_unresolved", "role_unresolved", "name_and_role_unresolved", "history_confirmation"}),
     "identity_schema_field": frozenset({
         "root", "root.extra", "unknown", "name", "name.status", "name.value", "name.note",
@@ -83,11 +84,26 @@ REASON_ENUMS = {
         "role.evidence.extra", "role.extra",
     }),
     "identity_schema_error": frozenset({"missing", "invalid_choice", "invalid_type", "length_limit", "unexpected_field", "invalid_format"}),
+    "score_schema_field": frozenset({
+        'root', 'root.extra', 'unknown',
+        'judgments', 'judgments.item', 'judgments.extra',
+        'judgments.criterion_id', 'judgments.verdict', 'judgments.reason', 'judgments.question', 'judgments.requirement_mode',
+        'judgments.evidence', 'judgments.evidence.item', 'judgments.evidence.span_id',
+        'judgments.evidence.interpretation', 'judgments.evidence.extra',
+        'facts', 'facts.item', 'facts.extra', 'facts.field', 'facts.value',
+        'facts.evidence', 'facts.evidence.span_id', 'facts.evidence.interpretation', 'facts.evidence.extra',
+        'education', 'education.extra', 'education.degree', 'education.completion', 'education.admission',
+        'education.institution_match', 'education.catalog_id', 'education.interpretation',
+        'education.evidence', 'education.evidence.item', 'education.evidence.span_id',
+        'education.evidence.interpretation', 'education.evidence.extra',
+    }),
+    "score_schema_error": frozenset({"missing", "invalid_choice", "invalid_type", "length_limit", "unexpected_field", "invalid_format"}),
 }
 REASON_NUMBERS = {
     "criterion_index": (1, 1000), "fact_index": (1, 1000), "evidence_index": (1, 1000),
     "quote_characters": (0, 20000), "value_characters": (0, 20000),
     "identity_schema_error_count": (1, 1000), "identity_evidence_index": (1, 1000),
+    "score_schema_error_count": (1, 1000),
 }
 REASON_FIELDS = frozenset(REASON_ENUMS) | frozenset(REASON_NUMBERS)
 _FILE = re.compile(r"^diagnostic-(\d{4}-\d{2}-\d{2})(?:\.(0[1-9]))?\.jsonl$")

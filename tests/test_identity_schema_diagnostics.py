@@ -9,7 +9,7 @@ import pytest
 
 from hr_assist.db import dump, now, uid
 from hr_assist.diagnostics import BEIJING, Diagnostics
-from hr_assist.identities import _identity_schema_diagnostic, validate_identity
+from hr_assist.identities import IdentityResult, _identity_schema_diagnostic, validate_identity
 from hr_assist.storage import BusinessError
 from test_core import configure
 
@@ -79,7 +79,6 @@ def read_rows(log):
     ('string_type', 'name.value', 'invalid_type', None),
     ('evidence_list_type', 'name.evidence', 'invalid_type', None),
     ('evidence_item_type', 'name.evidence.item', 'invalid_type', 1),
-    ('root_extra', 'root.extra', 'unexpected_field', None),
     ('name_extra', 'name.extra', 'unexpected_field', None),
     ('evidence_extra', 'role.evidence.extra', 'unexpected_field', 1),
     ('note_length', 'role.note', 'length_limit', None),
@@ -120,9 +119,12 @@ def test_multiple_schema_errors_have_bounded_count_and_value_free_message(identi
     raw = answer()
     for key in range(1100):
         raw[f'{PRIVATE}-{key}'] = PRIVATE
-    with pytest.raises(BusinessError) as raised:
-        validate_identity(raw, [], [])
-    error = raised.value
+    # The strict schema remains useful for old-log classification and the
+    # prompt contract even though final identity results project root extras.
+    with pytest.raises(ValidationError) as raised:
+        IdentityResult.model_validate(raw)
+    message, details = _identity_schema_diagnostic(raised.value)
+    error = BusinessError('IDENTITY_SCHEMA', message, diagnostics=details)
     assert error.diagnostics['identity_schema_error_count'] == 1000
     assert error.diagnostics['identity_schema_field'] == 'root.extra'
     assert error.diagnostics['identity_schema_error'] == 'unexpected_field'

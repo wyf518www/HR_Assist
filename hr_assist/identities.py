@@ -145,9 +145,18 @@ def private_contact_filter(text):
     return text
 
 
-def validate_identity(raw, sources, roles):
+def validate_identity(raw, sources, roles, *, format_adjustments=None):
+    # Only the two documented root objects can affect identity. A model may
+    # append an explanation/score alongside them; discard that extra output
+    # without interpreting its key or value. Nested structures remain strict,
+    # and a wrapper cannot supply a missing name/role object.
+    extra_count = 0
+    normalized = raw
+    if isinstance(raw, dict):
+        extra_count = len(raw.keys() - {'name', 'role'})
+        normalized = {key: raw[key] for key in ('name', 'role') if key in raw}
     try:
-        result=IdentityResult.model_validate(raw)
+        result=IdentityResult.model_validate(normalized)
     except ValidationError as exc:
         message, details = _identity_schema_diagnostic(exc)
         raise BusinessError('IDENTITY_SCHEMA', message, diagnostics=details) from exc
@@ -173,6 +182,8 @@ def validate_identity(raw, sources, roles):
     output=result.model_dump()
     for key in ('name','role'):
         output[key]['evidence']=bound[key]
+    if format_adjustments is not None and extra_count:
+        format_adjustments['extra_fields_ignored'] = extra_count
     return output
 
 
@@ -246,15 +257,21 @@ class Identities:
         # resume its saved analysis instead of silently returning the old result.
         self.db.put(pending_key,fingerprint)
         raw,meta=two_pass(self.service.model_snapshot(settings),SYSTEM,payload,task='identity',db=self.db,reserve=reserve,force=force)
-        result=validate_identity(raw,payload['sources'],payload['available_roles'])
+        format_adjustments={}
+        result=validate_identity(raw,payload['sources'],payload['available_roles'],format_adjustments=format_adjustments)
         proposal={'id':uid(),'application_id':app['id'],'fingerprint':fingerprint,'state_token':state_token(app),
                   'result':result,'version':VERSION,'model':settings['model'],
                   'generation_profile':generation_profile(settings),**meta,'created_at':now()}
+        if format_adjustments:
+            proposal['format_adjustments']=format_adjustments
         with self.db.connect(True) as con:
             con.execute('INSERT INTO meta VALUES (?,?)',('identity_result:'+proposal['id'],dump(proposal)))
             con.execute('INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                         ('identity_proposal:'+app['id'],dump(proposal['id'])))
             con.execute('DELETE FROM meta WHERE key=? AND value=?',(pending_key,dump(fingerprint)))
+        if format_adjustments:
+            count=format_adjustments['extra_fields_ignored']
+            self.db.event('MODEL_FORMAT_NORMALIZED',f'姓名与岗位识别已忽略{count}个格式约定以外的顶层字段；仅采用经校验的姓名、岗位和原文依据，不记录额外字段名称或取值。',application_id=app['id'])
         return proposal
 
     def resolve(self,app,reserve):

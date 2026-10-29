@@ -147,6 +147,6 @@ def test_both_model_stages_receive_new_policy_and_only_reviewed_admission_is_sco
         assert payload['education_policy']['admission_default_value'] == 'not_stated'
         assert 'non_regular' in system and 'unknown' in system
     assert model.calls[0][1]['education_policy'] == model.calls[1][1]['education_policy']
-    assert result['prompt_version'] == 'v9-admission-default'
+    assert result['prompt_version'] == 'v10-validation-feedback'
     assert result['education_gate'] == 'fail' and result['grade'] == '待定'
     assert result['education']['admission'] == 'non_regular'

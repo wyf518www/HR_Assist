@@ -15,13 +15,25 @@ const diagnosticFacts={company:'当前公司',education_level:'学历',admission
 const diagnosticIdentityReasons={name_unresolved:'姓名尚不能确认',role_unresolved:'应聘岗位尚不能确认或未对应启用岗位',name_and_role_unresolved:'姓名和应聘岗位均需核对',history_confirmation:'已有历史评分，身份建议需人工确认后应用'};
 const diagnosticIdentitySchemaFields={root:'整体结果','root.extra':'顶层额外字段',unknown:'未归类字段',name:'姓名结果','name.status':'姓名识别状态','name.value':'姓名文字','name.note':'姓名说明','name.evidence':'姓名依据列表','name.evidence.item':'姓名依据条目','name.evidence.span_id':'姓名依据来源编号','name.evidence.interpretation':'姓名依据解读','name.evidence.extra':'姓名依据额外字段','name.extra':'姓名结果额外字段',role:'岗位结果','role.status':'岗位识别状态','role.value':'岗位文字','role.note':'岗位说明','role.role_id':'岗位编号','role.evidence':'岗位依据列表','role.evidence.item':'岗位依据条目','role.evidence.span_id':'岗位依据来源编号','role.evidence.interpretation':'岗位依据解读','role.evidence.extra':'岗位依据额外字段','role.extra':'岗位结果额外字段'};
 const diagnosticIdentitySchemaErrors={missing:'缺少必填字段',invalid_choice:'取值不在允许选项中',invalid_type:'字段类型不符合要求',length_limit:'长度或条目数量超限',unexpected_field:'包含未约定的额外字段',invalid_format:'字段格式不符合要求'};
-Object.assign(diagnosticNumbers,{identity_schema_error_count:'格式问题数量',identity_evidence_index:'身份依据序号'});
+const diagnosticScoreSchemaFields={root:'整体评分结果','root.extra':'评分结果顶层额外字段',unknown:'未归类评分字段',judgments:'评分条目列表','judgments.item':'评分条目','judgments.extra':'评分条目额外字段','judgments.criterion_id':'评分条目编号','judgments.verdict':'评分判定','judgments.reason':'评分理由','judgments.question':'建议追问','judgments.requirement_mode':'要求是否适用','judgments.evidence':'评分依据列表','judgments.evidence.item':'评分依据条目','judgments.evidence.span_id':'评分依据来源编号','judgments.evidence.interpretation':'评分依据解读','judgments.evidence.extra':'评分依据额外字段',facts:'事实列表','facts.item':'事实条目','facts.extra':'事实额外字段','facts.field':'事实类别','facts.value':'事实取值','facts.evidence':'事实依据对象','facts.evidence.span_id':'事实依据来源编号','facts.evidence.interpretation':'事实依据解读','facts.evidence.extra':'事实依据额外字段',education:'学历政策依据','education.extra':'学历依据额外字段','education.degree':'学历类别','education.completion':'学历取得状态','education.admission':'招生方式','education.institution_match':'院校名录对应状态','education.catalog_id':'院校名录编号','education.interpretation':'学历政策解读','education.evidence':'学历依据列表','education.evidence.item':'学历依据条目','education.evidence.span_id':'学历依据来源编号','education.evidence.interpretation':'学历依据解读','education.evidence.extra':'学历依据额外字段'};
+const diagnosticScoreSchemaErrors={...diagnosticIdentitySchemaErrors,length_limit:'长度或条目数量不符合要求'};
+const diagnosticEducationCatalogReasons={catalog_id_missing:'模型标记为名录内院校，但未给出对应名录编号',catalog_id_unknown:'模型返回的院校编号不属于本次提供的已确认名录',status_id_conflict:'模型给出的院校对应状态与名录编号相互矛盾'};
+Object.assign(diagnosticNumbers,{identity_schema_error_count:'身份格式问题数量',identity_evidence_index:'身份依据序号',score_schema_error_count:'评分格式问题数量'});
 function diagnosticMapped(map,value){return Object.hasOwn(map,value)?map[value]:'';}
 function diagnosticExplanation(row,waiting){
   if(row.error_code==='BATCH_STOPPED')return '<div class="notice mt-small">同批次其他模型请求已触发暂停，本候选人的后续请求未发送，已完成步骤保留。此项随批次暂停，不新增模型调用失败或业务异常；请先处理该批次的首个暂停原因，再继续处理。</div>';
   if(waiting){
     const reason=diagnosticMapped(diagnosticIdentityReasons,row.identity_reason);
     return `<div class="notice mt-small">${E(reason||'姓名或应聘岗位需要人工核对')}。请到“候选人库 → 姓名与岗位核对”，对照原件确认姓名与岗位，再点击“确认修正所选”。需要模型给出新建议时使用“重新分析所选”。</div>`;
+  }
+  if(row.error_code==='MODEL_SCHEMA'){
+    const field=diagnosticMapped(diagnosticScoreSchemaFields,row.score_schema_field),reason=diagnosticMapped(diagnosticScoreSchemaErrors,row.score_schema_error);
+    const position=[['criterion_index','评分项'],['fact_index','事实项'],['evidence_index','依据项']].filter(([key])=>Number.isInteger(row[key])&&row[key]>=1&&row[key]<=1000).map(([key,label])=>`${label}第 ${row[key]} 项`).join('，');
+    return `<div class="notice mt-small">${field&&reason?`${E(field)}：${E(reason)}。${position?`位置：模型输出中的${E(position)}（从1开始）。`:''}`:'此记录未包含具体评分格式字段，无法仅凭该记录确定哪一项缺失、类型错误或超出限制；请查看“运行记录 → 处理日志”的完整提示。'}未采用格式无效的评分，已有历史评分和人工跟进保留。诊断仅显示字段类别和序号，不保存模型取值。</div>`;
+  }
+  if(row.error_code==='EDUCATION_CATALOG_INVALID'){
+    const reason=diagnosticMapped(diagnosticEducationCatalogReasons,row.education_catalog_reason);
+    return `<div class="notice mt-small">${E(reason||'此记录未包含具体院校编号错误原因，无法确定是编号缺失、不属于本次名录，还是状态与编号矛盾')}。这是模型输出的名录关联问题，不能据此认定候选人的院校不在名单或学历不符；未生成本次评分。请核对已确认院校名录后继续处理，或对照原件人工核验。</div>`;
   }
   if(row.error_code==='IDENTITY_SCHEMA'){
     const field=diagnosticMapped(diagnosticIdentitySchemaFields,row.identity_schema_field),reason=diagnosticMapped(diagnosticIdentitySchemaErrors,row.identity_schema_error);

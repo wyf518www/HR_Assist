@@ -20,7 +20,7 @@ DIMENSIONS = {"hard":20,"skills":30,"experience":30,"achievements":10,"stability
 FIELD_LABELS = {"education":"学历","experience":"经验年限","location":"地点","certificates":"证书","availability":"到岗时间","responsibilities":"岗位职责","skills":"核心技能"}
 REQUIRED_JD_FIELDS = tuple(key for key in FIELD_LABELS if key not in {"availability", "location"})
 FACT_LABELS = {"company":"当前公司", "education_level":"学历", "admission":"招生方式", "institution":"毕业院校", "experience":"工作年限"}
-ASSESSMENT_PROMPT_VERSION = "v9-admission-default"
+ASSESSMENT_PROMPT_VERSION = "v10-validation-feedback"
 DIMENSION_LABELS = {"hard":"硬性条件", "skills":"核心技能", "experience":"工作经验", "achievements":"项目成果", "stability":"稳定性"}
 
 
@@ -407,10 +407,23 @@ def validate_and_score(raw, spans, criteria, policy, is_sales):
         education=result.education.model_dump()
         education["evidence"]=bind(result.education.evidence, {'validation_kind':'fact_evidence','fact_field':'education_level'})
         school_id=education['catalog_id']
-        if ((education['institution_match']=='catalog' and school_id not in catalog)
-                or (education['institution_match']!='catalog' and school_id is not None)):
-            raise BusinessError('EDUCATION_CATALOG_INVALID','模型选择的院校目录项无效或与匹配状态冲突；未生成评分，请手动重试。',
-                                diagnostics={'validation_kind':'fact_value','fact_field':'institution'})
+        catalog_reason=None
+        if education['institution_match']=='catalog':
+            if school_id is None:
+                catalog_reason='catalog_id_missing'
+            elif school_id not in catalog:
+                catalog_reason='catalog_id_unknown'
+        elif school_id is not None:
+            catalog_reason='status_id_conflict'
+        if catalog_reason:
+            detail={
+                'catalog_id_missing':'模型标记为名录内院校，但未给出对应名录编号',
+                'catalog_id_unknown':'模型返回的院校编号不属于本次提供的已确认名录',
+                'status_id_conflict':'模型给出的院校对应状态与名录编号相互矛盾',
+            }[catalog_reason]
+            raise BusinessError('EDUCATION_CATALOG_INVALID',detail+'；未生成本次评分，不能据此认定候选人学历不符。',
+                                diagnostics={'validation_kind':'fact_value','fact_field':'institution',
+                                             'education_catalog_reason':catalog_reason,'model_step':'review'})
         education['catalog_name']=catalog[school_id]['name'] if school_id in catalog else None
         # An unstated admission mode is a policy default, never a confirmed
         # factual claim of national admission. Keep source references for OCR
@@ -465,6 +478,38 @@ def validate_and_score(raw, spans, criteria, policy, is_sales):
     return output
 
 
+def assessment_review_feedback(raw, spans, criteria, policy, is_sales):
+    """Give the existing reviewer local contract failures, never a local verdict.
+
+    Validation is pure: no records are saved and no score is accepted here.
+    Messages for these codes contain fixed labels/positions, not model values.
+    The reviewer must still reread sources and return a complete valid result.
+    """
+    feedback={
+        'stage':'analysis',
+        'scope':'structure_and_source_ids_only',
+        'instructions':(
+            '以下是程序对第一步草稿的结构和来源编号检查，不是事实或评分结论。'
+            '即使检查通过，仍须独立核验原文并复核所有条目；发现错误应在本次返回中纠正。'
+            '返回output_schema规定的完整业务JSON，不返回校验说明或包装对象。'
+            'education.institution_match=catalog时，catalog_id必须原样选自education_policy.catalog中的id，不能填学校名或自造编号；'
+            'institution_match=not_in_catalog或unknown时，catalog_id必须为null。'
+            '学校是否对应名录仍按原文含义判断，不能为通过格式检查而随意选择名录项、删除学历信息或改成不在名录。'
+            '本检查只报告首先发现的问题；仍需检查完整结果中的所有必填字段、类型、枚举和长度限制。'
+        ),
+    }
+    try:
+        validate_and_score(raw,spans,criteria,policy,is_sales)
+    except BusinessError as exc:
+        if exc.code not in {'MODEL_SCHEMA','MODEL_CRITERIA','EVIDENCE_SOURCE_INVALID','FACT_CONFLICT','EDUCATION_CATALOG_INVALID'}:
+            raise
+        feedback.update(status='invalid',error_code=exc.code,message=exc.message,
+                        diagnostics={**exc.diagnostics,'model_step':'analysis'})
+    else:
+        feedback['status']='valid'
+    return feedback
+
+
 def assess(model, application, jd, spans, policy, *, db=None, reserve=None):
     if not policy.get("confirmed"):
         raise BusinessError("POLICY_UNCONFIRMED", "请先确认学历策略和评分规则。")
@@ -506,7 +551,9 @@ def assess(model, application, jd, spans, policy, *, db=None, reserve=None):
                                  "admission_policy":ADMISSION_POLICY_VERSION,"admission_not_stated_pass":True,
                                  "admission_default_value":"not_stated",
                                  "doctor_policy":"not_covered"}}
-    raw,meta=two_pass(model,system,payload,task="assessment",db=db,reserve=reserve)
+    raw,meta=two_pass(model,system,payload,task="assessment",db=db,reserve=reserve,
+                     review_feedback=lambda draft:assessment_review_feedback(
+                         draft,safe_spans,criteria,policy,bool(application['is_sales'])))
     result=validate_and_score(raw,safe_spans,criteria,policy,bool(application["is_sales"]))
     result.update({**meta,"model":model.settings["model"],"prompt_version":ASSESSMENT_PROMPT_VERSION,"evidence_spans":safe_spans,
                    "generation_profile":generation_profile(model.settings)})

@@ -95,3 +95,45 @@ test('batch stop is a neutral pause rather than another model failure or identit
     assert.doesNotMatch(html,/等待人工核对|候选人库 → 姓名与岗位核对/);
   }
 });
+
+test('score schema failures explain fixed field classes and model output array positions',()=>{
+  const html=render({...base,phase:'assessment',event:'PHASE_FAILED',error_code:'MODEL_SCHEMA',
+    score_schema_field:'judgments.evidence.interpretation',score_schema_error:'missing',score_schema_error_count:2,
+    criterion_index:4,evidence_index:2,model_step:'review'});
+  assert.match(html,/评分依据解读：缺少必填字段/);
+  assert.match(html,/模型输出中的评分项第 4 项，依据项第 2 项（从1开始）/);
+  assert.match(html,/评分格式问题数量/);
+  assert.match(html,/未采用格式无效的评分，已有历史评分和人工跟进保留/);
+  assert.match(html,/第二步 · 语义复核/);
+  assert.match(html,/class="diagnostic-failed"/);
+  assert.doesNotMatch(html,/逐字匹配|简历原文不符/);
+});
+
+test('legacy and unrecognized score schema diagnostics do not invent a missing field',()=>{
+  for(const fields of [{},{score_schema_field:'facts.private-field',score_schema_error:'private-value'}]){
+    const html=render({...base,phase:'assessment',event:'PHASE_FAILED',error_code:'MODEL_SCHEMA',...fields});
+    assert.match(html,/此记录未包含具体评分格式字段/);
+    assert.match(html,/运行记录 → 处理日志/);
+    const explanation=html.split('<details')[0];
+    assert.doesNotMatch(explanation,/private-|评分依据解读：缺少必填字段/);
+  }
+  const html=render({...base,phase:'assessment',event:'PHASE_FAILED',error_code:'MODEL_SCHEMA',
+    score_schema_field:'facts.evidence',score_schema_error:'invalid_type',fact_index:'<script>unsafe</script>',evidence_index:0});
+  assert.match(html,/事实依据对象：字段类型不符合要求/);
+  assert.doesNotMatch(html,/<script>|模型输出中的/);
+});
+
+test('education catalog errors describe model IDs without rejecting a candidate school',()=>{
+  for(const [reason,message] of [
+    ['catalog_id_missing','模型标记为名录内院校，但未给出对应名录编号'],
+    ['catalog_id_unknown','模型返回的院校编号不属于本次提供的已确认名录'],
+    ['status_id_conflict','模型给出的院校对应状态与名录编号相互矛盾'],
+  ]){
+    const html=render({...base,phase:'assessment',event:'PHASE_FAILED',error_code:'EDUCATION_CATALOG_INVALID',education_catalog_reason:reason});
+    assert.ok(html.includes(message));
+    assert.match(html,/不能据此认定候选人的院校不在名单或学历不符/);
+    assert.match(html,/未生成本次评分/);
+  }
+  const old=render({...base,phase:'assessment',event:'PHASE_FAILED',error_code:'EDUCATION_CATALOG_INVALID'});
+  assert.match(old,/此记录未包含具体院校编号错误原因/);
+});

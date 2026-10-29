@@ -33,6 +33,19 @@ FACT_FIELDS = frozenset({"field", "value", "evidence"})
 EVIDENCE_FIELDS = frozenset({"span_id", "interpretation"})
 EDUCATION_FIELDS = frozenset({"degree", "completion", "admission", "institution_match", "catalog_id", "evidence", "interpretation"})
 SAFE_PATH_FIELDS = ROOT_FIELDS | JUDGMENT_FIELDS | FACT_FIELDS | EVIDENCE_FIELDS | EDUCATION_FIELDS
+SCORE_SCHEMA_FIELDS = frozenset({
+    'root', 'root.extra', 'unknown',
+    'judgments', 'judgments.item', 'judgments.extra',
+    'judgments.criterion_id', 'judgments.verdict', 'judgments.reason', 'judgments.question', 'judgments.requirement_mode',
+    'judgments.evidence', 'judgments.evidence.item', 'judgments.evidence.span_id',
+    'judgments.evidence.interpretation', 'judgments.evidence.extra',
+    'facts', 'facts.item', 'facts.extra', 'facts.field', 'facts.value',
+    'facts.evidence', 'facts.evidence.span_id', 'facts.evidence.interpretation', 'facts.evidence.extra',
+    'education', 'education.extra', 'education.degree', 'education.completion', 'education.admission',
+    'education.institution_match', 'education.catalog_id', 'education.interpretation',
+    'education.evidence', 'education.evidence.item', 'education.evidence.span_id',
+    'education.evidence.interpretation', 'education.evidence.extra',
+})
 VERDICT_LABELS = {"满足":"met", "部分满足":"partial", "不满足":"not_met", "未知":"unknown"}
 FORMAT_LABELS = {
     "evidence_whitespace_aligned":"评分引文仅有空格或换行差异，已对齐并保存原文",
@@ -130,12 +143,83 @@ def schema_diagnostic(error):
     return "模型输出结构不符（数组序号从1开始）："+"；".join(details)+suffix+"。未生成评分；诊断不含模型原文或字段取值。"
 
 
+def _score_schema_location(location):
+    """Classify only known structural paths; unknown raw keys never escape."""
+    indices = {}
+
+    def index(value, name):
+        if type(value) is int and 0 <= value < 1000:
+            indices[name] = value + 1
+
+    if not location:
+        return 'root', indices
+    group = location[0]
+    if group not in ROOT_FIELDS:
+        return 'root.extra', indices
+    tail = location[1:]
+    if not tail:
+        return group, indices
+    if group in {'judgments', 'facts'}:
+        if type(tail[0]) is not int:
+            return group + '.extra', indices
+        index(tail[0], 'criterion_index' if group == 'judgments' else 'fact_index')
+        tail = tail[1:]
+        if not tail:
+            return group + '.item', indices
+    allowed = JUDGMENT_FIELDS if group == 'judgments' else FACT_FIELDS if group == 'facts' else EDUCATION_FIELDS
+    key = tail[0]
+    if key not in allowed:
+        return group + '.extra', indices
+    if len(tail) == 1:
+        return group + '.' + key, indices
+    if key != 'evidence':
+        return group + '.extra', indices
+    tail = tail[1:]
+    if group == 'facts':
+        # Facts have exactly one evidence object, not an arbitrary list.
+        indices['evidence_index'] = 1
+    else:
+        if type(tail[0]) is not int:
+            return group + '.evidence.extra', indices
+        index(tail[0], 'evidence_index')
+        tail = tail[1:]
+        if not tail:
+            return group + '.evidence.item', indices
+    if len(tail) == 1 and tail[0] in EVIDENCE_FIELDS:
+        return group + '.evidence.' + tail[0], indices
+    return group + '.evidence.extra', indices
+
+
+def score_schema_metadata(error):
+    """Fixed categories and bounded output-array positions, never input values."""
+    entries = error.errors(include_input=False, include_context=False, include_url=False)
+    first = entries[0] if entries else {}
+    field, indices = _score_schema_location(first.get('loc', ()))
+    kind = first.get('type')
+    if kind == 'missing':
+        category = 'missing'
+    elif kind in {'literal_error', 'enum'}:
+        category = 'invalid_choice'
+    elif kind in {'string_type', 'list_type', 'model_type', 'model_attributes_type', 'dict_type'}:
+        category = 'invalid_type'
+    elif kind in {'string_too_long', 'string_too_short', 'too_long', 'too_short'}:
+        category = 'length_limit'
+    elif kind == 'extra_forbidden':
+        category = 'unexpected_field'
+    else:
+        category = 'invalid_format'
+    return {'validation_kind': 'score_schema', 'model_step': 'review',
+            'score_schema_field': field if field in SCORE_SCHEMA_FIELDS else 'unknown',
+            'score_schema_error': category,
+            'score_schema_error_count': max(1, min(error.error_count(), 1000)), **indices}
+
+
 def parse_model_result(raw):
     normalized,changes=normalize_model_output(raw)
     try:
         return ModelResult.model_validate(normalized),changes
     except ValidationError as exc:
-        raise BusinessError("MODEL_SCHEMA",schema_diagnostic(exc)) from exc
+        raise BusinessError("MODEL_SCHEMA",schema_diagnostic(exc),diagnostics=score_schema_metadata(exc)) from exc
 
 
 def output_schema():

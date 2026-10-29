@@ -66,12 +66,13 @@ def _step(step):
         raise
 
 
-def two_pass(model,system,payload,*,task,db=None,reserve=None,force=False):
+def two_pass(model,system,payload,*,task,db=None,reserve=None,force=False,review_feedback=None):
     """Resume a saved first pass after a review timeout/budget failure.
 
 The key freezes sources, schema, prompt, model and generation settings. Secrets
 are never sent in the payload or stored with the draft. Each actual call reserves
-its own budget; no retries are automatic.
+its own budget; no retries are automatic. Optional read-only validation feedback
+belongs only to review, so changing it does not invalidate a saved analysis.
 """
     settings=model.settings
     fingerprint=hashlib.sha256(dump({'version':'semantic-pair-v1','task':task,'system':system,
@@ -100,10 +101,16 @@ its own budget; no retries are automatic.
     # Even when only one call remains in this batch, the first result survives;
     # the next manual continuation may spend its budget on review only.
     with _step('review'):
+        review_system=REVIEW_INSTRUCTIONS+'\n本任务规则：\n'+system
+        review_payload={**deepcopy(payload),'task_stage':'semantic_review','analysis_result':deepcopy(analysis),
+                        'review_instructions':REVIEW_INSTRUCTIONS}
+        if review_feedback is not None:
+            # The callback cannot change the authoritative cached draft. Its
+            # result is request data, never a replacement result or a log entry.
+            review_payload['validation_feedback']=review_feedback(deepcopy(analysis))
+            review_system+='\nvalidation_feedback是程序对第一步草稿的检查提示，请据此纠正格式和来源编号问题；仍须独立核验原文，不把检查通过当作事实已确认。'
         if reserve:reserve()
-        result,review_usage=model.complete(REVIEW_INSTRUCTIONS+'\n本任务规则：\n'+system,
-            {**deepcopy(payload),'task_stage':'semantic_review','analysis_result':deepcopy(analysis),
-             'review_instructions':REVIEW_INSTRUCTIONS})
+        result,review_usage=model.complete(review_system,review_payload)
     review_usage=_usage(review_usage)
     if not isinstance(result,dict):
         raise BusinessError('MODEL_SCHEMA','模型语义复核未返回JSON对象。',diagnostics={'model_step':'review'})
