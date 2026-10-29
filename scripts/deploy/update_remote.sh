@@ -3,8 +3,15 @@
 set -eu
 umask 077
 if [ "$(id -u)" != 0 ]; then
+    if [ "${HR_ASSIST_SUDO_STDIN:-0}" = 1 ]; then
+        exec sudo -S -p '' sh "$0" "$@"
+    fi
     exec sudo sh "$0" "$@"
 fi
+# No update subprocess should inherit an unread password when root or
+# passwordless sudo did not need to consume it. All intentional Docker input
+# below is redirected from a verified helper file.
+exec </dev/null
 [ "$#" = 5 ] || { echo 'Usage: update_remote.sh PROJECT SERVICE IMAGE RELEASE SHA256'; exit 2; }
 project=$1 service=$2 image=$3 release=$4 digest=$5
 case "$project" in /*) ;; *) echo 'Project must be absolute.'; exit 2;; esac

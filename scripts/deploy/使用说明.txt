@@ -1,5 +1,41 @@
 HR Assist — Windows 一键更新工具
 
+本工具支持在 Windows 本机加密保存 SSH 密码。已保存时，双击更新工具会自动登录、
+上传并执行 sudo 升级，无需再次输入 y 或密码；未保存时继续使用原来的交互方式。
+
+零、启用自动密码登录（已有连接配置）
+
+1. 将本次工具包完整解压并合并到原工具目录，保留 .local-deployment/remote-update.json。
+2. 双击 Save-SSH-Password.cmd，确认显示的目标，按提示在本机输入 SSH 密码。
+   输入内容隐藏；此操作只保存本地凭据，不连接群晖、不执行升级。
+3. 默认 sudo 使用同一个密码；如不同，在 PowerShell 中执行：
+     .\Save-SSH-Password.cmd -SeparateSudoPassword
+4. 将本次可信累计包放入 updates，建议只保留这一个包。
+5. 等待工作台任务结束后，双击 Update-HRAssist.cmd。此时自动跳过 y/N 和密码输入，
+   保留包校验、任务空闲检查、备份和健康检查；结束窗口保留结果供查看。
+
+密码用 Windows DPAPI 按当前用户加密，保存于：
+  %LOCALAPPDATA%\HR-Assist-Updater\credentials\
+即使工具在 Y 盘或共享目录，密码仍保存在 Windows 本机，不在 ZIP、项目或配置 JSON 内。
+文件按主机、SSH端口和用户名区分，仅当前 Windows 用户和 SYSTEM 可访问。
+复制加密文件到另一台电脑或另一用户不能直接使用，需要重新保存密码。
+修改密码后再次双击 Save-SSH-Password.cmd 覆盖保存；无需将密码发给任何人。
+
+删除当前目标保存的密码（只删除本机凭据）：
+  .\Update-HRAssist.cmd -ForgetPassword
+
+临时使用原交互登录（不删除密码）：
+  .\Update-HRAssist.cmd -Interactive
+
+自动模式严格检查已知 SSH 主机指纹，绝不自动接受未知或变化的主机密钥。
+首次连接尚未建立信任时，自动模式会停止；使用 -Interactive，核对主机指纹后接受。
+指纹发生变化时应先核实 NAS 的密钥，不要直接删除 known_hosts 或关闭校验。
+自动模式使用 SSH password 认证；要求额外验证码、多因素认证或仅密钥登录的目标，
+请用 -Interactive。不会把保存密码当作验证码或私钥口令。
+sudo密码经SSH加密连接的标准输入发送，不出现在命令参数、环境变量或日志中。
+自动执行不分配远程终端，避免回显密码；若NAS sudo策略要求终端，使用 -Interactive。
+root或免密sudo无需消费密码时，升级脚本会关闭标准输入，避免后续Docker命令读到它。
+
 一、第一次使用
 
 1. 将整个 ZIP 解压到 Windows 的一个固定文件夹。不要在压缩软件中直接运行。
@@ -16,7 +52,7 @@ HR Assist — Windows 一键更新工具
    第一次连接可能要求确认主机指纹，核对后再接受；工具不会跳过主机校验。
 
 连接信息仅保存在解压目录的 .local-deployment/remote-update.json。
-不保存密码、API 密钥或邮箱授权码。无需把密码提供给他人。
+此JSON不保存密码、API密钥或邮箱授权码。可另外使用上面的本机加密密码功能。
 前提：Windows 已能连接群晖 SSH，账号具备执行 Docker 和 sudo 的权限。
 工具使用 Windows 自带的 ssh、scp 和 tar；缺少时会显示错误，不会自行安装软件。
 上传明确使用传统 SCP 协议（scp -O，字母大写 O），通过 SSH 传输，不依赖群晖的 SFTP 子系统。
@@ -31,7 +67,7 @@ HR Assist — Windows 一键更新工具
 1. 把新的、可信的 HR Assist 累计更新包（hr-assist-*.tar.gz）放进 updates 文件夹，无需解压。
 2. 建议 updates 中仅保留本次要使用的包；旧包移到其他文件夹。
    存在多个包时，脚本按本地文件修改时间选最新一个，并显示名称供确认；不联网查询版本。
-3. 双击 Update-HRAssist.cmd，确认目标和包名，输入 y，再按 SSH 提示输入密码。
+3. 双击 Update-HRAssist.cmd。已保存本机密码时自动执行；未保存则确认 y 并按提示输入密码。
 4. 等待 UPDATE SUCCESS 和 Container is healthy。
    核对 RUNNING_VERSION 与所用更新包配套说明中的版本一致。
 5. 浏览器按 Ctrl+F5 刷新工作台，检查候选人、岗位及运行记录。
@@ -97,8 +133,11 @@ source-before/ 保存更新前的源码。NAS 中的备份目录仅供管理员�
 使用其他本地配置文件：
   .\Update-HRAssist.cmd -Config "D:\本地配置\remote-update.json"
 
-跳过启动前的 y/N 确认（仍需 SSH 密码）：
+跳过启动前的 y/N 确认（未保存密码时仍需交互登录）：
   .\Update-HRAssist.cmd -Yes
+
+保存或更新当前目标的本机密码，不连接群晖：
+  .\Update-HRAssist.cmd -SavePassword
 
 配置中的 Service / Image 默认为 hr-assist / hr-assist:0.1.0。
 如果你的实际部署曾修改服务名或镜像标签，请同步修改本地 JSON 后再使用。

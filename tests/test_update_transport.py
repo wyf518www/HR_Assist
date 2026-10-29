@@ -52,7 +52,8 @@ def test_no_sftp_upload_and_failure_stops_before_remote_update(tmp_path, upload_
     distribution = tmp_path/'updater with spaces'
     scripts = distribution/'scripts/deploy'
     scripts.mkdir(parents=True)
-    for name in ('Update-HRAssist.ps1', 'update_remote.sh', 'update_helper.py'):
+    for name in ('Update-HRAssist.ps1', 'update_remote.sh', 'update_helper.py',
+                 'Local-Credentials.ps1', 'Password-Transport.ps1'):
         shutil.copyfile(ROOT/'scripts/deploy'/name, scripts/name)
     package = tmp_path/'hr-assist-synthetic.tar.gz'
     with tarfile.open(package, 'w:gz') as archive:

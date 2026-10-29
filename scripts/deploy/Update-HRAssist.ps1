@@ -4,7 +4,11 @@ param(
     [string]$Package = '',
     [switch]$Plan,
     [switch]$Yes,
-    [switch]$Configure
+    [switch]$Configure,
+    [switch]$SavePassword,
+    [switch]$ForgetPassword,
+    [switch]$SeparateSudoPassword,
+    [switch]$Interactive
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -12,6 +16,10 @@ $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $privateRoot = Join-Path $repoRoot '.local-deployment'
 if (-not $Config) { $Config = Join-Path $privateRoot 'remote-update.json' }
 $Config = [IO.Path]::GetFullPath($Config)
+$localCredentials = $null
+$askpassEnvironment = @{}
+. (Join-Path $PSScriptRoot 'Local-Credentials.ps1')
+. (Join-Path $PSScriptRoot 'Password-Transport.ps1')
 
 function Read-Setting([string]$Label, [string]$Default = '') {
     $value = Read-Host "$Label [$Default]"
@@ -35,9 +43,13 @@ function Check-Configuration($Value) {
 }
 
 try {
+    if (@($Plan, $Configure, $SavePassword, $ForgetPassword).Where({ $_ }).Count -gt 1) {
+        throw 'Choose only one of -Plan, -Configure, -SavePassword or -ForgetPassword.'
+    }
+    if ($SeparateSudoPassword -and -not $SavePassword) { throw '-SeparateSudoPassword requires -SavePassword.' }
     if ($Configure -or -not (Test-Path -LiteralPath $Config)) {
         if ($Plan -and -not $Configure) { throw 'Configuration is missing. Run once with -Configure, then use -Plan.' }
-        Write-Host 'First-time setup. Credentials are NOT saved; SSH will ask for your password.'
+        Write-Host 'First-time connection setup. Passwords never go in this JSON configuration.'
         $defaultPackages = Join-Path $repoRoot 'updates'
         if (-not (Test-Path -LiteralPath $defaultPackages)) { $defaultPackages = $privateRoot }
         $settings = [PSCustomObject]@{
@@ -58,6 +70,27 @@ try {
         $settings = Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json
         Check-Configuration $settings
     }
+    if ($ForgetPassword) {
+        Remove-HRLocalCredential -Settings $settings
+        Write-Host 'Saved SSH/sudo passwords removed for this target. Interactive login remains available.'
+        exit 0
+    }
+    if ($SavePassword) {
+        Write-Host "Save password locally for $($settings.User)@$($settings.Host):$($settings.Port)."
+        Write-Host 'Windows encrypts it for this Windows account on this computer. Future double-clicks start the update without y/N or password prompts.'
+        $sshPassword = Read-Host 'SSH password (hidden)' -AsSecureString
+        $sudoPassword = $null
+        try {
+            if ($SeparateSudoPassword) { $sudoPassword = Read-Host 'sudo password (hidden)' -AsSecureString }
+            Save-HRLocalCredential -Settings $settings -Password $sshPassword -SudoPassword $sudoPassword
+        } finally {
+            if ($null -ne $sshPassword) { $sshPassword.Dispose() }
+            if ($null -ne $sudoPassword) { $sudoPassword.Dispose() }
+        }
+        Write-Host 'Encrypted local passwords saved. No SSH connection or update was performed.'
+        Write-Host 'Keep only the intended cumulative package in updates, then double-click Update-HRAssist.cmd.'
+        exit 0
+    }
     if (-not $Package) {
         $choices = @(Get-ChildItem -LiteralPath $settings.PackageDirectory -Filter 'hr-assist-*.tar.gz' -File | Sort-Object LastWriteTimeUtc -Descending)
         if (-not $choices.Count) { throw 'No cumulative update package found. Put the new .tar.gz in PackageDirectory, or pass -Package.' }
@@ -76,7 +109,24 @@ try {
     Write-Host 'Plan: upload -> validate -> offline build -> stop -> complete backup -> activate -> health check.'
     Write-Host 'Configuration and volume paths are preserved. Backups stay on the NAS. No GitHub access.'
     if ($Plan) { Write-Host 'PLAN ONLY: no SSH connection or remote changes were made.'; exit 0 }
-    if (-not $Yes -and (Read-Host 'Stop using the workbench until the update finishes. Start now? [y/N]') -notmatch '^(?i:y|yes)$') {
+    $savedPasswordMode = -not $Interactive -and (Test-HRLocalCredential -Settings $settings)
+    if ($savedPasswordMode) {
+        $localCredentials = Read-HRLocalCredential -Settings $settings
+        Write-Host 'Saved-password mode: starting automatically. Stop using the workbench until the update finishes.'
+        $askpass = Join-Path $PSScriptRoot 'ssh-askpass.cmd'
+        if (-not (Test-Path -LiteralPath $askpass -PathType Leaf)) { throw 'Missing ssh-askpass.cmd. Extract the complete updater package again.' }
+        $targetJson = @{ Host=$settings.Host; Port=[int]$settings.Port; User=$settings.User } | ConvertTo-Json -Compress
+        $values = @{
+            SSH_ASKPASS=$askpass; SSH_ASKPASS_REQUIRE='force'; DISPLAY='hr-assist-local:0';
+            HR_ASSIST_ASKPASS_ACTIVE='1'; HR_ASSIST_ASKPASS_TARGET=$targetJson;
+            HR_ASSIST_ASKPASS_ROOT=[IO.Path]::GetDirectoryName((Get-HRCredentialPath -Settings $settings))
+        }
+        foreach ($entry in $values.GetEnumerator()) {
+            $askpassEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, 'Process')
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
+        }
+    }
+    if (-not $savedPasswordMode -and -not $Yes -and (Read-Host 'Stop using the workbench until the update finishes. Start now? [y/N]') -notmatch '^(?i:y|yes)$') {
         Write-Host 'Cancelled. No remote changes.'
         exit 0
     }
@@ -98,18 +148,47 @@ try {
     $target = "$($settings.User)@$($settings.Host)"
     $remoteArchive = ".hr-assist-upload-$release.tar"
     $remoteStage = ".hr-assist-upload-$release"
-    Write-Host 'Uploading via legacy SCP over SSH (no SFTP required). Enter the password when prompted.'
+    Write-Host 'Uploading via legacy SCP over SSH (no SFTP required).'
     # OpenSSH 9+ defaults to SFTP. DSM can allow SSH while its SFTP subsystem
     # is disabled; -O selects the traditional SCP protocol over the same SSH.
-    & $scp -O -P ([string]$settings.Port) -o StrictHostKeyChecking=ask $transport "${target}:$remoteArchive"
-    if ($LASTEXITCODE -ne 0) { throw 'Upload failed. The Docker service was not changed.' }
+    if ($savedPasswordMode) {
+        # A saved password must never approve an unknown/replaced host key or
+        # answer a private-key passphrase / MFA challenge.
+        $sshOptions = @('-o','StrictHostKeyChecking=yes','-o','BatchMode=no','-o','NumberOfPasswordPrompts=1',
+            '-o','PreferredAuthentications=password','-o','PasswordAuthentication=yes','-o','PubkeyAuthentication=no',
+            '-o','KbdInteractiveAuthentication=no','-o','ConnectTimeout=20')
+        & $scp -O -P ([string]$settings.Port) @sshOptions $transport "${target}:$remoteArchive"
+    } else {
+        & $scp -O -P ([string]$settings.Port) -o StrictHostKeyChecking=ask $transport "${target}:$remoteArchive"
+    }
+    if ($LASTEXITCODE -ne 0) { throw 'Upload failed. The Docker service was not changed. For an unknown host key, use -Interactive and verify the fingerprint; for a changed password, run -SavePassword again.' }
     # All remote arguments have been restricted to non-shell syntax above.
     $remoteCommand = "set -eu`numask 077`nmkdir '$remoteStage'`ntar -xf '$remoteArchive' -C '$remoteStage'`nrm -f '$remoteArchive'`nexec sh '$remoteStage/update_remote.sh' '$($settings.ProjectDir)' '$($settings.Service)' '$($settings.Image)' '$release' '$digest'"
-    Write-Host 'Starting update. SSH may ask again; a non-root account may also receive a sudo password prompt.'
-    & $ssh -tt -p ([string]$settings.Port) -o StrictHostKeyChecking=ask -o ServerAliveInterval=15 -o ServerAliveCountMax=4 $target $remoteCommand
-    if ($LASTEXITCODE -ne 0) { throw 'Remote update did not report success. Read the last message and NAS backup/status before retrying; do not delete the update lock blindly.' }
+    if ($savedPasswordMode) {
+        # Only this fixed flag crosses SSH; the sudo password travels through
+        # redirected stdin, with no terminal echo, arguments, or disk copy.
+        $remoteCommand = $remoteCommand.Replace('exec sh ', 'exec env HR_ASSIST_SUDO_STDIN=1 sh ')
+        Write-Host 'Starting update with encrypted local credentials.'
+        $sshArgs = @('-T','-p',([string]$settings.Port)) + $sshOptions + @('-o','ServerAliveInterval=15','-o','ServerAliveCountMax=4',$target,$remoteCommand)
+        $updateExit = Invoke-HRWithSecureInput -Executable $ssh -Arguments $sshArgs -Password $localCredentials.SudoPassword
+    } else {
+        Write-Host 'Starting update. SSH may ask again; a non-root account may also receive a sudo password prompt.'
+        & $ssh -tt -p ([string]$settings.Port) -o StrictHostKeyChecking=ask -o ServerAliveInterval=15 -o ServerAliveCountMax=4 $target $remoteCommand
+        $updateExit = $LASTEXITCODE
+    }
+    if ($updateExit -ne 0) { throw 'Remote update did not report success. Read the last message and NAS backup/status before retrying; do not delete the update lock blindly.' }
     Write-Host 'Update finished successfully. Refresh the workbench with Ctrl+F5.' -ForegroundColor Green
 } catch {
     Write-Host ("UPDATE ERROR: " + $_.Exception.Message) -ForegroundColor Red
     exit 1
+} finally {
+    foreach ($entry in $askpassEnvironment.GetEnumerator()) {
+        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
+    }
+    if ($null -ne $localCredentials) {
+        $localCredentials.Password.Dispose()
+        if (-not [Object]::ReferenceEquals($localCredentials.Password, $localCredentials.SudoPassword)) {
+            $localCredentials.SudoPassword.Dispose()
+        }
+    }
 }
