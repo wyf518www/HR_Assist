@@ -71,7 +71,7 @@ class SettingsInput(Input):
     llm_max_tokens: int | None = Field(default=None, ge=1024, le=131072, strict=True)
     llm_approved: bool = False
     approval_note: str = Field(default="", max_length=2000)
-    max_calls_per_run: int = Field(default=30, ge=1, le=200)
+    max_calls_per_run: int = Field(default=30, ge=1, le=1000)
     schedule_enabled: bool = False
     schedule_time: str = "09:00"
     diagnostics_enabled: bool | None = None
