@@ -72,6 +72,7 @@ class SettingsInput(Input):
     llm_approved: bool = False
     approval_note: str = Field(default="", max_length=2000)
     max_calls_per_run: int = Field(default=30, ge=1, le=1000)
+    resume_concurrency: int | None = Field(default=None, ge=1, le=10, strict=True)
     schedule_enabled: bool = False
     schedule_time: str = "09:00"
     diagnostics_enabled: bool | None = None
@@ -84,6 +85,8 @@ class SettingsInput(Input):
 
     @model_validator(mode="after")
     def check(self):
+        if "resume_concurrency" in self.model_fields_set and self.resume_concurrency is None:
+            raise ValueError("同时处理简历数不能为空；请选择 1—10 之间的整数")
         if "llm_reasoning_effort" in self.model_fields_set and self.llm_reasoning_effort is None:
             raise ValueError("思考强度不能为空；恢复供应商默认请选 default")
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", self.schedule_time):

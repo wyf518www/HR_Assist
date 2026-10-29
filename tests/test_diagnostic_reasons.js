@@ -58,3 +58,40 @@ test('mapped explanations reject unrecognized values and all raw metadata is esc
   assert.doesNotMatch(html,/<img|<script/);
   assert.match(html,/&lt;img/);
 });
+
+test('identity schema errors show fixed field labels and error classes without model values',()=>{
+  const html=render({timestamp:base.timestamp,phase:'identity',event:'PHASE_FAILED',error_code:'IDENTITY_SCHEMA',validation_kind:'identity_schema',identity_schema_field:'role.evidence.interpretation',identity_schema_error:'missing',identity_schema_error_count:2,identity_evidence_index:1,model_step:'review'});
+  assert.match(html,/岗位依据解读：缺少必填字段/);
+  assert.match(html,/格式问题数量：<b>2/);
+  assert.match(html,/身份依据序号：<b>1/);
+  assert.match(html,/第二步 · 语义复核/);
+  assert.match(html,/原记录未因格式错误被覆盖/);
+});
+
+test('historical or unrecognized identity schema metadata does not invent a cause',()=>{
+  for(const metadata of [{},{identity_schema_field:'<private>',identity_schema_error:'__proto__'}]){
+    context.oldIdentity={error_code:'IDENTITY_SCHEMA',...metadata};
+    const html=vm.runInContext('diagnosticExplanation(oldIdentity,false)',context);
+    assert.match(html,/无法仅凭该记录判断/);
+    assert.doesNotMatch(html,/<private>|__proto__|缺少必填字段/);
+  }
+});
+
+test('duplicate application explanation keeps manual reconciliation explicit',()=>{
+  const html=render({timestamp:base.timestamp,phase:'identity',event:'PHASE_FAILED',error_code:'DUPLICATE_APPLICATION'});
+  assert.match(html,/同一简历原件已有目标岗位申请/);
+  assert.match(html,/评分和人工跟进/);
+  assert.match(html,/不会自动合并或删除/);
+});
+
+test('batch stop is a neutral pause rather than another model failure or identity review',()=>{
+  for(const event of ['PHASE_WAITING','PHASE_FAILED']){
+    const html=render({timestamp:base.timestamp,phase:'assessment',event,error_code:'BATCH_STOPPED',application_id:'b'.repeat(32),model_step:'review'});
+    assert.match(html,/随批次暂停/);
+    assert.match(html,/本候选人的后续请求未发送，已完成步骤保留/);
+    assert.match(html,/不新增模型调用失败或业务异常/);
+    assert.match(html,/处理该批次的首个暂停原因/);
+    assert.doesNotMatch(html,/class="diagnostic-failed"|class="error-message"/);
+    assert.doesNotMatch(html,/等待人工核对|候选人库 → 姓名与岗位核对/);
+  }
+});

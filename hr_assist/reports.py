@@ -3,8 +3,10 @@ from datetime import date, datetime
 from io import BytesIO
 import html
 import json
+import re
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -19,6 +21,16 @@ MANUAL_COLUMNS=["推荐给用人部门日期","约面时间","用人部门复筛
 MANUAL_CHOICES={"用人部门复筛结果":("通过","不通过"),"面试状态":("待面试","已面","拒绝面试"),"面试结果":("通过","待定","未通过")}
 OVERVIEW_COLUMNS=["岗位名称","推荐日期","姓名","匹配度","推荐等级","当前公司","年限","核心优势","主要风险","建议",*MANUAL_COLUMNS]
 FOLLOWUP_COLUMNS=["记录ID","岗位名称","姓名",*MANUAL_COLUMNS]
+
+# XML 1.0 excludes these code points even though PDF/model text may contain
+# them. Escape only the exported display; never normalize stored source text.
+_XML_UNSUPPORTED = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+_XML_DISPLAY_TOKEN = re.compile(r"\[U\+[0-9A-F]{4,6}\]")
+_XML_DISPLAY_NOTE = ("导出显示说明：Excel 不支持的字符以 [U+XXXX] 码点标记显示。"
+                     "只调整此文件的显示，原始简历、保存的解析原文、评分和人工跟进内容未修改。")
+_TRUNCATED_DISPLAY_SUFFIX = "\n[内容过长，已缩短显示；完整内容请在工作台查看]"
+_TRUNCATED_DISPLAY_NOTE = ("导出显示说明：该自动汇总超过 Excel 单元格长度限制，仅缩短此文件中的显示。"
+                           "完整内容保留在工作台；保存的原文、评分和人工跟进内容未修改。")
 
 
 def empty_cells():
@@ -71,9 +83,55 @@ def display_cell(cell):
     return value.isoformat() if isinstance(value,(date,datetime)) else value
 
 
-def text_cell(cell, value):
-    cell.value="" if value is None else str(value)
+def excel_display_text(value):
+    value="" if value is None else str(value)
+    return _XML_UNSUPPORTED.sub(lambda match:f"[U+{ord(match[0]):04X}]",value)
+
+
+def _excel_units(text):
+    return len(text.encode('utf-16-le'))//2
+
+
+def _display_end(display, start, limit):
+    end=min(start+limit,len(display))
+    if _excel_units(display[start:end])>limit:
+        units=0
+        for offset,char in enumerate(display[start:end]):
+            units+=2 if ord(char)>0xffff else 1
+            if units>limit:
+                end=start+offset
+                break
+    if end<len(display):
+        for marker in _XML_DISPLAY_TOKEN.finditer(display,max(start,end-10),min(len(display),end+10)):
+            if marker.start()<end<marker.end():
+                end=marker.start()
+                break
+    return end
+
+
+def _evidence_chunks(display):
+    """Split after escaping, keeping visible code-point markers in one row."""
+    chunks=[]
+    start=0
+    while start<len(display):
+        end=_display_end(display,start,15000)
+        chunks.append(display[start:end])
+        start=end
+    return chunks or ['']
+
+
+def text_cell(cell, value, *, escaped_source=False):
+    original="" if value is None else str(value)
+    display=excel_display_text(original)
+    notes=[_XML_DISPLAY_NOTE] if escaped_source or display!=original else []
+    if _excel_units(display)>32767:
+        end=_display_end(display,0,32767-_excel_units(_TRUNCATED_DISPLAY_SUFFIX))
+        display=display[:end]+_TRUNCATED_DISPLAY_SUFFIX
+        notes.append(_TRUNCATED_DISPLAY_NOTE)
+    cell.value=display
     cell.data_type="s"  # Do not interpret model/filename text as Excel formulas.
+    if notes:
+        cell.comment=Comment('\n'.join(notes),"HR Assist")
 
 
 def write_manual(cell, original):
@@ -348,16 +406,18 @@ def overview_export(db, storage):
             for ref in item["evidence"] or [{"span_id":"","quote":empty_quote}]:
                 span=span_map.get(ref["span_id"],{})
                 source=ref['quote']
-                # Excel cells have a character limit. Split long original source
-                # spans into rows instead of silently truncating their evidence.
-                chunks=[source[i:i+15000] for i in range(0,len(source),15000)] or ['']
+                display=excel_display_text(source)
+                # Escape before splitting: one unsupported character expands
+                # into a visible marker. Never let Excel truncate the evidence.
+                chunks=_evidence_chunks(display)
                 for part,chunk in enumerate(chunks,1):
                     position=f"{ref['span_id']} / 第 {ref.get('page') or span.get('page') or '—'} 页"
                     if len(chunks)>1:position+=f" / 原文片段 {part}/{len(chunks)}"
                     values=[row["id"],row["role_name"],result.get("jd_version_id",""),item["dimension"],item["description"],item["verdict"],item["awarded"],
                             position,chunk,"已确认 JD 结构化要求" if item["source"]=="jd" else "用户确认的全局评分规则",ref.get('interpretation','') if ref.get('semantic') else '']
                     for col,value in enumerate(values,1):
-                        text_cell(evidence.cell(evidence.max_row+1 if col==1 else evidence.max_row,col),value)
+                        text_cell(evidence.cell(evidence.max_row+1 if col==1 else evidence.max_row,col),value,
+                                  escaped_source=col==9 and display!=source)
     style_sheet(evidence,99)
     buffer=BytesIO();book.save(buffer)
     file=storage.put(buffer.getvalue(),"招聘推荐总览.xlsx","reports")

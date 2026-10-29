@@ -34,7 +34,7 @@ DEFAULT_SETTINGS = {
     "mail": {"account": "", "host": "imap.qq.com", "port": 993,
              "keywords": ["【BOSS直聘】", "应聘"], "match_mode": "all", "enabled": False},
     "llm": {"endpoint": "", "model": "", "approved": False, "approval_note": "",
-            "max_calls_per_run": 30, "timeout_seconds": 300,
+            "max_calls_per_run": 30, "timeout_seconds": 300, "resume_concurrency": 1,
             "reasoning_effort": "default", "max_tokens": None},
     "schedule": {"enabled": False, "time": "09:00", "timezone": "Asia/Shanghai"},
     "diagnostics": {"enabled": True, "retention_days": 7, "cleanup_time": "03:00"},

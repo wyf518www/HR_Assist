@@ -1,5 +1,7 @@
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 import json
+import threading
 import uuid
 
 import pytest
@@ -120,3 +122,54 @@ def test_legacy_exceptions_and_stored_failure_events_remain_supported(reason_log
     reason_log.write('PHASE_FAILED', phase='identity', error_code='IDENTITY_REVIEW_REQUIRED')
     assert records(reason_log)[-1]['event'] == 'PHASE_FAILED'
     assert 'private-secret' not in reason_log.export('2026-10-28').decode()
+
+
+def test_batch_stop_is_logged_as_waiting_without_changing_or_swallowing_error(reason_log):
+    from hr_assist.parallel import BatchStopped
+    error = BatchStopped()
+    with pytest.raises(BatchStopped) as raised:
+        with reason_log.operation('assessment'):
+            raise error
+    assert raised.value is error
+    row = records(reason_log)[-1]
+    assert row['event'] == 'PHASE_WAITING'
+    assert row['error_code'] == 'BATCH_STOPPED'
+    assert row['exception_type'] == 'BatchStopped'
+    reason_log.failure('identity', error)
+    assert records(reason_log)[-1]['event'] == 'PHASE_WAITING'
+    exported = [json.loads(line) for line in reason_log.export('2026-10-28').decode().splitlines()]
+    assert all(row['event'] not in {'MODEL_REQUEST_FAILED', 'PHASE_FAILED'} for row in exported)
+    assert str(error) not in reason_log.export('2026-10-28').decode()
+
+
+def test_parallel_model_events_keep_their_own_candidate_trace_and_step(reason_log):
+    gate = threading.Barrier(2)
+    run = uuid.uuid4().hex
+    pairs = [(uuid.uuid4().hex, uuid.uuid4().hex) for _ in range(2)]
+
+    def worker(pair):
+        application, request = pair
+        with reason_log.operation('assessment', run_id=run, application_id=application) as trace:
+            with module.context_fields(model_step='analysis'):
+                gate.wait(5)
+                module.emit('MODEL_REQUEST_STARTED', request_id=request)
+                gate.wait(5)
+                module.emit('MODEL_REQUEST_COMPLETED', request_id=request)
+            with module.context_fields(model_step='review'):
+                gate.wait(5)
+                module.emit('MODEL_REQUEST_COMPLETED', request_id=request)
+        # A recycled worker must not keep the completed candidate context.
+        module.emit('MODEL_REQUEST_STARTED', request_id=uuid.uuid4().hex)
+        return application, trace
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        traces = dict(pool.map(worker, pairs))
+    request_rows = [row for row in records(reason_log) if row['event'].startswith('MODEL_')]
+    assert len(request_rows) == 6 and len(set(traces.values())) == 2
+    expected = {request: application for application, request in pairs}
+    for row in request_rows:
+        assert row['run_id'] == run
+        assert row['application_id'] == expected[row['request_id']]
+        assert row['trace_id'] == traces[row['application_id']]
+    for application, request in pairs:
+        assert [row['model_step'] for row in request_rows if row['request_id'] == request] == ['analysis', 'analysis', 'review']

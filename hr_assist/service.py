@@ -1,5 +1,5 @@
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,6 +13,7 @@ import time
 from .assessment import MODEL_CALL_ERRORS, CloudModel, assess, assessment_key, default_criteria, missing_jd_fields, name_looks_like_location, scoring_criteria, validate_redaction_name
 from .assessment_explanations import decision_reasons
 from .model_contract import format_adjustment_message
+from .parallel import BatchControl, BatchStopped, bounded_candidates
 from .config import DEFAULT_SETTINGS
 from .db import Database, dump, now, uid
 from .documents import extract_file
@@ -42,6 +43,9 @@ class Service:
         self.diagnostics=Diagnostics(environment.state_dir,self.settings)
         self.run_lock=threading.Lock()
         self.ingest_lock=threading.Lock()
+        # PDF extraction, quarantine and archive writes share a short local
+        # critical section. Model requests never hold this lock.
+        self.document_lock=threading.RLock()
         self.identities=Identities(self)
         self.stop_event=threading.Event()
         self.worker=None
@@ -67,6 +71,8 @@ class Service:
                               match_mode=data.subject_mode,enabled=data.mail_enabled)
         config["llm"].update(endpoint=data.llm_endpoint,model=data.llm_model,approved=data.llm_approved,
                              approval_note=data.approval_note,max_calls_per_run=data.max_calls_per_run)
+        if data.resume_concurrency is not None:
+            config['llm']['resume_concurrency']=data.resume_concurrency
         if data.llm_timeout_seconds is not None:
             config["llm"]["timeout_seconds"]=data.llm_timeout_seconds
         for key in ('reasoning_effort','max_tokens'):
@@ -101,24 +107,29 @@ class Service:
 
     def model_snapshot(self,settings):
         model=self.model()
-        if isinstance(model,CloudModel) and model.settings!=settings:
+        def request_settings(value):
+            return {key:item for key,item in value.items() if key not in {'resume_concurrency','max_calls_per_run'}}
+        if isinstance(model,CloudModel) and request_settings(model.settings)!=request_settings(settings):
             # No request has been sent. A fresh manual run can use the new
             # configuration; never label a response with an older cache key.
             raise BusinessError('MODEL_REQUEST','准备请求期间模型配置已变更，本次未发送；请使用新配置手动继续处理。')
         return model
 
     @contextmanager
-    def _phase(self,phase,run_id,**fields):
+    def _phase(self,phase,run_id,*,update_stage=True,**fields):
         """Link operations to a batch without putting business text in diagnostics."""
-        self.db.execute('UPDATE runs SET stage=? WHERE id=?',(phase,run_id))
+        if update_stage:
+            self.db.execute('UPDATE runs SET stage=? WHERE id=?',(phase,run_id))
         try:
             with self.diagnostics.operation(phase,run_id=run_id,**fields):
                 yield
         except BusinessError as exc:
+            if isinstance(exc,BatchStopped):
+                raise
             label={'mail_fetch':'邮件获取','document_parse':'简历解析','identity':'姓名与岗位识别',
                    'assessment':'简历评分','report_export':'报告生成','archive':'岗位归档',
                    'identity_review':'姓名与岗位核对'}.get(phase,'任务处理')
-            raise BusinessError(exc.code,f'{label}阶段：{exc.message}',exc.status) from exc
+            raise BusinessError(exc.code,f'{label}阶段：{exc.message}',exc.status,diagnostics=exc.diagnostics) from exc
 
     def roles(self, *, summary=False, identity=None):
         where=' WHERE r.id=?' if identity is not None else ''
@@ -338,6 +349,10 @@ class Service:
         self.db.event("CLASSIFIED","岗位已人工确认。",application_id=identity)
 
     def parse_document(self,application,update_status=True):
+        with self.document_lock:
+            return self._parse_document(application,update_status)
+
+    def _parse_document(self,application,update_status=True):
         file,path=self.storage.file(application["file_id"])
         document=self.db.one("SELECT * FROM documents WHERE file_id=?",(file["id"],))
         if not document or document["status"]=="FAILED":
@@ -356,6 +371,10 @@ class Service:
         return json.loads(document['spans'])
 
     def parse_application(self,application):
+        with self.document_lock:
+            return self._parse_application(application)
+
+    def _parse_application(self,application):
         spans=self.parse_document(application)
         file,path=self.storage.file(application['file_id'])
         role=self.db.one("SELECT * FROM roles WHERE id=?",(application["role_id"],)) if application["role_id"] else None
@@ -424,16 +443,17 @@ class Service:
             raise BusinessError("RUN_BUSY","已有任务运行中，请等待完成。",409)
         identity=uid()
         try:
+            batch_settings=self.settings()
             self.db.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?)",(identity,trigger,"RUNNING","preflight",None,None,"{}",None,now(),None))
             self.db.put("request:"+key,identity)
-            self.worker=threading.Thread(target=self._run_identities if mode=='identity' else self._run,args=(identity,application_ids,force_identity) if mode=='identity' else (identity,mode),daemon=True)
+            self.worker=threading.Thread(target=self._run_identities if mode=='identity' else self._run,args=(identity,application_ids,force_identity,batch_settings) if mode=='identity' else (identity,mode,batch_settings),daemon=True)
             self.worker.start()
         except BaseException:
             self.run_lock.release()
             raise
         return self.db.one("SELECT * FROM runs WHERE id=?",(identity,))
 
-    def _run(self,run_id,mode):
+    def _run(self,run_id,mode,batch_settings):
         stats={"emails":0,"new_resumes":0,"duplicates":0,"archived":0,"assessed":0,"reused":0,"exceptions":0,"reports":0,"grades":{g:0 for g in ("强烈推荐","推荐","待定","不推荐")},"roles":{}}
         cutoff=datetime.now(timezone.utc)
         cursor=self.db.get("mail_cursor",{})
@@ -477,13 +497,9 @@ class Service:
                             self.db.execute("UPDATE mail_events SET status='COMPLETED' WHERE id=?",(event["id"],))
                         new_cursor={"cutoff":cutoff.isoformat(),"last_uid":max_uid,"uid_validity":inbox.uid_validity}
             self.db.execute("UPDATE runs SET stage='processing' WHERE id=?",(run_id,))
-            calls=0
-            config=self.settings()
-            def reserve():
-                nonlocal calls
-                if calls>=config['llm']['max_calls_per_run']:
-                    raise BusinessError('MODEL_BUDGET','本批次模型调用上限已达到；姓名岗位识别与评分共用上限，请在后续任务继续。')
-                calls+=1
+            config=batch_settings
+            control=BatchControl(config['llm']['max_calls_per_run'],config['llm']['resume_concurrency'],self.stop_event)
+            stats['resume_concurrency']=control.concurrency
             ready=[]
             blocked=None
             for application in applications(self.db):
@@ -512,62 +528,19 @@ class Service:
                 except BusinessError as exc:
                     self._exception(run_id,exc.code,exc.message,stats,application['id'])
             self.db.execute("UPDATE runs SET stage='identity_and_assessment' WHERE id=?",(run_id,))
-            for application in ready:
-                try:
-                    if blocked:
-                        continue
-                    if self.stop_event.is_set():
-                        raise BusinessError('SHUTDOWN','服务关闭，未完成项将在后续任务继续。')
-                    with self._phase('identity',run_id,application_id=application['id'],file_id=application['file_id']):
-                        application=self.identities.resolve(application,reserve)
-                    with self._phase('archive',run_id,application_id=application['id'],file_id=application['file_id']):
-                        spans,jd=self.parse_application(application)
-                    archive_key='archived:'+application['id']
-                    if application['role_id'] and not self.db.get(archive_key):
-                        stats['archived']+=1
-                        stats['roles'][application['role_name']]=stats['roles'].get(application['role_name'],0)+1
-                        self.db.put(archive_key,True)
-                        self.db.event('ARCHIVED','岗位归档完成，原件哈希一致。',run_id=run_id,application_id=application['id'])
-                    if spans is None:
-                        self._exception(run_id,'WAITING_INPUT','申请等待岗位启用、岗位确认或完整 JD。',stats,application['id'])
-                        continue
-                    if not self.preflight()['ready']:
-                        self.db.execute("UPDATE applications SET status='WAITING_CONFIG' WHERE id=?",(application['id'],))
-                        blocked='解析归档已完成；请补齐模型与评分规则后继续评估。'
-                        continue
-                    with self._phase('assessment',run_id,application_id=application['id'],file_id=application['file_id'],span_count=len(spans),input_characters=sum(len(s['text']) for s in spans)):
-                        application['name_confirmed']=self.name_is_confirmed(application) or self.identities.complete(application)
-                        validate_redaction_name(spans,application['name'],application['name_confirmed'])
-                        model_settings=deepcopy(self.settings()['llm'])
-                        model=self.model_snapshot(model_settings)
-                        key=assessment_key(application,jd,config["policy"],model_settings,spans)
-                        cached=self.db.one("SELECT * FROM assessments WHERE cache_key=?",(key,))
-                        if cached:
-                            result=json.loads(cached["result"]);assessment_id=cached["id"];stats["reused"]+=1
-                        else:
-                            result=assess(model,application,jd,spans,config["policy"],db=self.db,reserve=reserve)
-                            result["jd_version_id"]=jd["id"]
-                            assessment_id=uid()
-                            self.db.execute("INSERT INTO assessments VALUES (?,?,?,?,?,?,?)",(assessment_id,application["id"],jd["id"],key,"COMPLETED",dump(result),now()))
-                    self.db.execute("UPDATE applications SET assessment_id=?,status='ASSESSED',recommended_at=coalesce(recommended_at,?) WHERE id=?",(assessment_id,datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat(),application["id"]))
-                    stats["assessed"]+=1
-                    if result.get("format_adjustments"):
-                        self.db.event("MODEL_FORMAT_NORMALIZED",format_adjustment_message(result["format_adjustments"]),run_id=run_id,application_id=application["id"])
-                    for warning in result.get("validation_warnings",[]):
-                        self._exception(run_id,warning["code"],warning["message"],stats,application["id"])
-                    self.db.event("ASSESSED","暂计分完成，存在待核验项，请人工核验。" if result.get("provisional") else "证据校验和评分完成。",run_id=run_id,application_id=application["id"])
-                    stats["grades"][result["grade"]]=stats["grades"].get(result["grade"],0)+1
-                except BusinessError as exc:
-                    if exc.code in MODEL_CALL_ERRORS | {"MODEL_BUDGET","POLICY_UNCONFIRMED","SHUTDOWN"}:
-                        blocked=exc.message
-                        stats['failed_phase']=self.db.one('SELECT stage FROM runs WHERE id=?',(run_id,))['stage']
-                        self._exception(run_id,exc.code,exc.message,stats,application["id"])
-                        continue
-                    self.db.execute("UPDATE applications SET status=? WHERE id=?",("WAITING_IDENTITY" if exc.code.startswith('IDENTITY_') else "PARSE_FAILED" if exc.code.startswith(("PARSE","OCR","PDF","PAGE","EMPTY")) else "WAITING_REVIEW",application["id"]))
-                    self._exception(run_id,exc.code,exc.message,stats,application["id"])
+            process=lambda app:self._process_candidate(run_id,app,config,control)
+            with closing(bounded_candidates(ready,process,control)) as completed_candidates:
+                for completed in completed_candidates:
+                    self._merge_candidate_stats(stats,completed)
+                    stats['model_calls']=control.calls
+                    self.db.execute('UPDATE runs SET stats=? WHERE id=?',(dump(stats),run_id))
+            stats['model_calls']=control.calls
+            if control.error:
+                blocked=control.error.message
+                stats['failed_phase']=control.phase or 'identity_and_assessment'
             self.db.execute("UPDATE runs SET stage='reports' WHERE id=?",(run_id,))
             if blocked and stats["exceptions"]==0:
-                self._exception(run_id,"WAITING_CONFIG",blocked,stats)
+                self._exception(run_id,control.error.code,blocked,stats)
             with self._phase('report_export',run_id):
                 files=role_reports(self.db,self.storage,run_id)
                 stats["reports"]=len(files)
@@ -594,16 +567,83 @@ class Service:
         finally:
             self.run_lock.release()
 
-    def _run_identities(self,run_id,application_ids,force=False):
-        stats={'identity_analyzed':0,'identity_reused':0,'assessed':0,'exceptions':0}
-        calls=0
+    @staticmethod
+    def _merge_candidate_stats(stats,completed):
+        # Only the batch owner writes its aggregate; worker counters are local.
+        for key,value in completed.items():
+            if isinstance(value,dict):
+                for label,count in value.items():
+                    stats[key][label]=stats[key].get(label,0)+count
+            else:
+                stats[key]=stats.get(key,0)+value
+
+    def _process_candidate(self,run_id,application,config,control):
+        stats={'archived':0,'assessed':0,'reused':0,'exceptions':0,'grades':{},'roles':{}}
+        phase='identity'
+        fields={'application_id':application['id'],'file_id':application['file_id'],'update_stage':control.concurrency==1}
         try:
-            maximum=self.settings()['llm']['max_calls_per_run']
-            def reserve():
-                nonlocal calls
-                if calls>=maximum:
-                    raise BusinessError('MODEL_BUDGET','本批次模型调用上限已达到；已生成的核对建议保留，可继续选择其他记录分析。')
-                calls+=1
+            control.check()
+            with self._phase(phase,run_id,**fields):
+                application=self.identities.resolve(application,control.reserve)
+            phase='archive'
+            with self._phase(phase,run_id,**fields):
+                spans,jd=self.parse_application(application)
+            archive_key='archived:'+application['id']
+            if application['role_id'] and not self.db.get(archive_key):
+                stats['archived']+=1
+                stats['roles'][application['role_name']]=1
+                self.db.put(archive_key,True)
+                self.db.event('ARCHIVED','岗位归档完成，原件哈希一致。',run_id=run_id,application_id=application['id'])
+            if spans is None:
+                self._exception(run_id,'WAITING_INPUT','申请等待岗位启用、岗位确认或完整 JD。',stats,application['id'])
+                return stats
+            if not self.preflight()['ready']:
+                self.db.execute("UPDATE applications SET status='WAITING_CONFIG' WHERE id=?",(application['id'],))
+                control.stop(BusinessError('WAITING_CONFIG','解析归档已完成；请补齐模型与评分规则后继续评估。'),phase)
+                return stats
+            phase='assessment'
+            with self._phase(phase,run_id,**fields,span_count=len(spans),input_characters=sum(len(s['text']) for s in spans)):
+                application['name_confirmed']=self.name_is_confirmed(application) or self.identities.complete(application)
+                validate_redaction_name(spans,application['name'],application['name_confirmed'])
+                model_settings=deepcopy(self.settings()['llm'])
+                model=self.model_snapshot(model_settings)
+                key=assessment_key(application,jd,config['policy'],model_settings,spans)
+                cached=self.db.one('SELECT * FROM assessments WHERE cache_key=?',(key,))
+                if cached:
+                    result=json.loads(cached['result']);assessment_id=cached['id'];stats['reused']+=1
+                else:
+                    result=assess(model,application,jd,spans,config['policy'],db=self.db,reserve=control.reserve)
+                    result['jd_version_id']=jd['id']
+                    assessment_id=uid()
+                    self.db.execute('INSERT INTO assessments VALUES (?,?,?,?,?,?,?)',(assessment_id,application['id'],jd['id'],key,'COMPLETED',dump(result),now()))
+            self.db.execute("UPDATE applications SET assessment_id=?,status='ASSESSED',recommended_at=coalesce(recommended_at,?) WHERE id=?",(assessment_id,datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat(),application['id']))
+            stats['assessed']+=1
+            if result.get('format_adjustments'):
+                self.db.event('MODEL_FORMAT_NORMALIZED',format_adjustment_message(result['format_adjustments']),run_id=run_id,application_id=application['id'])
+            for warning in result.get('validation_warnings',[]):
+                self._exception(run_id,warning['code'],warning['message'],stats,application['id'])
+            self.db.event('ASSESSED','暂计分完成，存在待核验项，请人工核验。' if result.get('provisional') else '证据校验和评分完成。',run_id=run_id,application_id=application['id'])
+            stats['grades'][result['grade']]=1
+        except BatchStopped:
+            pass
+        except BusinessError as exc:
+            if exc.code in MODEL_CALL_ERRORS | {'MODEL_BUDGET','POLICY_UNCONFIRMED','SHUTDOWN'}:
+                control.stop(exc,phase)
+            else:
+                self.db.execute('UPDATE applications SET status=? WHERE id=?',('WAITING_IDENTITY' if exc.code.startswith('IDENTITY_') else 'PARSE_FAILED' if exc.code.startswith(('PARSE','OCR','PDF','PAGE','EMPTY')) else 'WAITING_REVIEW',application['id']))
+            self._exception(run_id,exc.code,exc.message,stats,application['id'])
+        except Exception as exc:
+            control.stop(BusinessError('INTERNAL_ERROR','任务出现内部错误；已保存完成的步骤，请查看日志或联系维护人员。'),phase)
+            self.diagnostics.failure(phase,exc,run_id=run_id,application_id=application['id'],file_id=application['file_id'])
+            self._exception(run_id,'INTERNAL_ERROR','任务出现内部错误；已保存完成的步骤，请查看日志或联系维护人员。',stats,application['id'])
+        return stats
+
+    def _run_identities(self,run_id,application_ids,force,batch_settings):
+        stats={'identity_analyzed':0,'identity_reused':0,'assessed':0,'exceptions':0}
+        try:
+            llm=batch_settings['llm']
+            control=BatchControl(llm['max_calls_per_run'],llm['resume_concurrency'],self.stop_event)
+            stats['resume_concurrency']=control.concurrency
             rows=applications(self.db)
             if application_ids:
                 identities=set(application_ids)
@@ -611,25 +651,15 @@ class Service:
                     raise BusinessError('APPLICATION_NOT_FOUND','部分申请已不存在，请刷新列表。',404)
                 rows=[r for r in rows if r['id'] in identities]
             self.db.execute("UPDATE runs SET stage='identity_review' WHERE id=?",(run_id,))
-            for app in rows:
-                if self.stop_event.is_set():
-                    raise BusinessError('SHUTDOWN','服务关闭，已生成核对建议保留。')
-                try:
-                    previous=self.identities.proposal(app['id'])
-                    marker=self.db.get('identity_applied:'+app['id'],{})
-                    if not force and previous and marker.get('proposal_id')==previous['id'] and self.identities.complete(app) and not self.db.get('identity_pending:'+app['id']):
-                        stats['identity_reused']+=1
-                        continue
-                    before=calls
-                    with self._phase('identity_review',run_id,application_id=app['id'],file_id=app['file_id']):
-                        self.identities.analyze(app,reserve,force=force)
-                    stats['identity_analyzed' if calls>before else 'identity_reused']+=1
-                    self.db.event('IDENTITY_PROPOSED','大模型已生成姓名与应聘岗位核对建议，当前记录未改动。',run_id=run_id,application_id=app['id'])
-                except BusinessError as exc:
-                    if exc.code in MODEL_CALL_ERRORS | {'MODEL_BUDGET'}:
-                        raise
-                    self._exception(run_id,exc.code,exc.message,stats,app['id'])
-                self.db.execute('UPDATE runs SET stats=? WHERE id=?',(dump(stats),run_id))
+            process=lambda app:self._process_identity(run_id,app,control,force)
+            with closing(bounded_candidates(rows,process,control)) as completed_candidates:
+                for completed in completed_candidates:
+                    self._merge_candidate_stats(stats,completed)
+                    stats['model_calls']=control.calls
+                    self.db.execute('UPDATE runs SET stats=? WHERE id=?',(dump(stats),run_id))
+            stats['model_calls']=control.calls
+            if control.error:
+                raise control.error
             self.db.execute("UPDATE runs SET status=?,stage='complete',stats=?,finished_at=? WHERE id=?",('SUCCESS_WITH_EXCEPTIONS' if stats['exceptions'] else 'SUCCESS',dump(stats),now(),run_id))
             self.db.notify(f"姓名与岗位核对：生成{stats['identity_analyzed']}条建议，复用{stats['identity_reused']}条，异常{stats['exceptions']}条。请在核对页面确认，当前记录未改动。",'info',run_id)
         except Exception as exc:
@@ -643,6 +673,36 @@ class Service:
             self.db.notify(message,'error',run_id)
         finally:
             self.run_lock.release()
+
+    def _process_identity(self,run_id,app,control,force):
+        stats={'identity_analyzed':0,'identity_reused':0,'exceptions':0}
+        calls=0
+        def reserve():
+            nonlocal calls
+            control.reserve()
+            calls+=1
+        try:
+            control.check()
+            previous=self.identities.proposal(app['id'])
+            marker=self.db.get('identity_applied:'+app['id'],{})
+            if not force and previous and marker.get('proposal_id')==previous['id'] and self.identities.complete(app) and not self.db.get('identity_pending:'+app['id']):
+                stats['identity_reused']+=1
+                return stats
+            with self._phase('identity_review',run_id,application_id=app['id'],file_id=app['file_id'],update_stage=False):
+                self.identities.analyze(app,reserve,force=force)
+            stats['identity_analyzed' if calls else 'identity_reused']+=1
+            self.db.event('IDENTITY_PROPOSED','大模型已生成姓名与应聘岗位核对建议，当前记录未改动。',run_id=run_id,application_id=app['id'])
+        except BatchStopped:
+            pass
+        except BusinessError as exc:
+            if exc.code in MODEL_CALL_ERRORS | {'MODEL_BUDGET','SHUTDOWN'}:
+                control.stop(exc,'identity_review')
+            self._exception(run_id,exc.code,exc.message,stats,app['id'])
+        except Exception as exc:
+            control.stop(BusinessError('INTERNAL_ERROR','姓名与岗位核对出现内部错误，已完成的建议保留，当前记录未改动。'),'identity_review')
+            self.diagnostics.failure('identity_review',exc,run_id=run_id,application_id=app['id'],file_id=app['file_id'])
+            self._exception(run_id,'INTERNAL_ERROR','姓名与岗位核对出现内部错误，已完成的建议保留，当前记录未改动。',stats,app['id'])
+        return stats
 
     def _exception(self,run_id,code,message,stats,application_id=None):
         stats["exceptions"]+=1

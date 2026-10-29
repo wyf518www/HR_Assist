@@ -47,7 +47,8 @@ APPLICATION_NOT_FOUND ARCHIVE_HASH DOCUMENT_MISSING DUPLICATE_APPLICATION JD_FIL
 NAME_CHANGED PREFLIGHT RESUME_FORMAT ROLE_ALREADY_ASSIGNED ROLE_DUPLICATE ROLE_IN_USE
 ROLE_INACTIVE ROLE_NOT_FOUND RUN_BUSY ENCRYPTED FILE_NOT_FOUND INVALID_OFFICE PATH_INVALID
 ZIP_LIMIT IDENTITY_SCHEMA IDENTITY_EVIDENCE_INVALID IDENTITY_FAILED INTERNAL_ERROR
-MODEL_BUDGET SHUTDOWN WAITING_CONFIG WAITING_INPUT IDENTITY_AMBIGUOUS IDENTITY_REVIEW_REQUIRED
+IDENTITY_VALUE IDENTITY_EVIDENCE IDENTITY_ROLE
+MODEL_BUDGET BATCH_STOPPED SHUTDOWN WAITING_CONFIG WAITING_INPUT IDENTITY_AMBIGUOUS IDENTITY_REVIEW_REQUIRED
 EVIDENCE_SOURCE_INVALID EDUCATION_CATALOG_INVALID
 """.split())
 EXCEPTION_TYPES = frozenset("""
@@ -56,7 +57,7 @@ TimeoutException HTTPStatusError ConnectError ReadError WriteError RemoteProtoco
 LocalProtocolError ProtocolError RequestError TransportError NetworkError JSONDecodeError
 ValidationError OSError IOError PermissionError FileNotFoundError RuntimeError KeyError
 TypeError UnicodeDecodeError EOFError Exception OtherException HTTPError InvalidURL IndexError
-AttributeError UnexpectedError
+AttributeError UnexpectedError IllegalCharacterError UnicodeEncodeError BatchStopped
 """.split())
 ID_FIELDS = frozenset({"run_id", "application_id", "jd_import_id", "file_id", "trace_id", "request_id"})
 NUMERIC_FIELDS = frozenset("""
@@ -69,15 +70,24 @@ cached_tokens input_tokens output_tokens attempt retry_count item_count candidat
 # In particular, do not accept custom JD ids, fact values, quotes or span ids.
 REASON_ENUMS = {
     "model_step": frozenset({"analysis", "review"}),
-    "validation_kind": frozenset({"score_evidence", "fact_evidence", "fact_value"}),
+    "validation_kind": frozenset({"score_evidence", "fact_evidence", "fact_value", "identity_schema"}),
     "evidence_reason": frozenset({"span_missing", "empty_quote", "no_match", "ambiguous_match", "value_missing"}),
     "criterion_dimension": frozenset({"hard", "skills", "experience", "achievements", "stability"}),
     "fact_field": frozenset({"company", "education_level", "admission", "institution", "experience"}),
     "identity_reason": frozenset({"name_unresolved", "role_unresolved", "name_and_role_unresolved", "history_confirmation"}),
+    "identity_schema_field": frozenset({
+        "root", "root.extra", "unknown", "name", "name.status", "name.value", "name.note",
+        "name.evidence", "name.evidence.item", "name.evidence.span_id", "name.evidence.interpretation",
+        "name.evidence.extra", "name.extra", "role", "role.status", "role.value", "role.note", "role.role_id",
+        "role.evidence", "role.evidence.item", "role.evidence.span_id", "role.evidence.interpretation",
+        "role.evidence.extra", "role.extra",
+    }),
+    "identity_schema_error": frozenset({"missing", "invalid_choice", "invalid_type", "length_limit", "unexpected_field", "invalid_format"}),
 }
 REASON_NUMBERS = {
     "criterion_index": (1, 1000), "fact_index": (1, 1000), "evidence_index": (1, 1000),
     "quote_characters": (0, 20000), "value_characters": (0, 20000),
+    "identity_schema_error_count": (1, 1000), "identity_evidence_index": (1, 1000),
 }
 REASON_FIELDS = frozenset(REASON_ENUMS) | frozenset(REASON_NUMBERS)
 _FILE = re.compile(r"^diagnostic-(\d{4}-\d{2}-\d{2})(?:\.(0[1-9]))?\.jsonl$")
@@ -180,7 +190,7 @@ def _failure(exc):
 
 
 def _failure_event(failure):
-    return "PHASE_WAITING" if failure.get("error_code") == "IDENTITY_REVIEW_REQUIRED" else "PHASE_FAILED"
+    return "PHASE_WAITING" if failure.get("error_code") in {"IDENTITY_REVIEW_REQUIRED", "BATCH_STOPPED"} else "PHASE_FAILED"
 
 
 def emit(event, **fields):

@@ -1,3 +1,3 @@
 """HR Assist: a single-user recruitment workbench."""
 
-__version__ = "0.1.0+v14.admission-reasons"
+__version__ = "0.1.0+v16.resume-parallel"

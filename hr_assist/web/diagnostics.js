@@ -13,12 +13,21 @@ const diagnosticEvidenceReasons={span_missing:'引用的原文片段不存在',e
 const diagnosticDimensions={hard:'硬性条件',skills:'核心技能',experience:'工作经验',achievements:'项目成果',stability:'稳定性'};
 const diagnosticFacts={company:'当前公司',education_level:'学历',admission:'招生方式',institution:'毕业院校',experience:'工作年限'};
 const diagnosticIdentityReasons={name_unresolved:'姓名尚不能确认',role_unresolved:'应聘岗位尚不能确认或未对应启用岗位',name_and_role_unresolved:'姓名和应聘岗位均需核对',history_confirmation:'已有历史评分，身份建议需人工确认后应用'};
+const diagnosticIdentitySchemaFields={root:'整体结果','root.extra':'顶层额外字段',unknown:'未归类字段',name:'姓名结果','name.status':'姓名识别状态','name.value':'姓名文字','name.note':'姓名说明','name.evidence':'姓名依据列表','name.evidence.item':'姓名依据条目','name.evidence.span_id':'姓名依据来源编号','name.evidence.interpretation':'姓名依据解读','name.evidence.extra':'姓名依据额外字段','name.extra':'姓名结果额外字段',role:'岗位结果','role.status':'岗位识别状态','role.value':'岗位文字','role.note':'岗位说明','role.role_id':'岗位编号','role.evidence':'岗位依据列表','role.evidence.item':'岗位依据条目','role.evidence.span_id':'岗位依据来源编号','role.evidence.interpretation':'岗位依据解读','role.evidence.extra':'岗位依据额外字段','role.extra':'岗位结果额外字段'};
+const diagnosticIdentitySchemaErrors={missing:'缺少必填字段',invalid_choice:'取值不在允许选项中',invalid_type:'字段类型不符合要求',length_limit:'长度或条目数量超限',unexpected_field:'包含未约定的额外字段',invalid_format:'字段格式不符合要求'};
+Object.assign(diagnosticNumbers,{identity_schema_error_count:'格式问题数量',identity_evidence_index:'身份依据序号'});
 function diagnosticMapped(map,value){return Object.hasOwn(map,value)?map[value]:'';}
 function diagnosticExplanation(row,waiting){
+  if(row.error_code==='BATCH_STOPPED')return '<div class="notice mt-small">同批次其他模型请求已触发暂停，本候选人的后续请求未发送，已完成步骤保留。此项随批次暂停，不新增模型调用失败或业务异常；请先处理该批次的首个暂停原因，再继续处理。</div>';
   if(waiting){
     const reason=diagnosticMapped(diagnosticIdentityReasons,row.identity_reason);
     return `<div class="notice mt-small">${E(reason||'姓名或应聘岗位需要人工核对')}。请到“候选人库 → 姓名与岗位核对”，对照原件确认姓名与岗位，再点击“确认修正所选”。需要模型给出新建议时使用“重新分析所选”。</div>`;
   }
+  if(row.error_code==='IDENTITY_SCHEMA'){
+    const field=diagnosticMapped(diagnosticIdentitySchemaFields,row.identity_schema_field),reason=diagnosticMapped(diagnosticIdentitySchemaErrors,row.identity_schema_error);
+    return `<div class="notice mt-small">${field&&reason?`${E(field)}：${E(reason)}。`:'此记录未包含具体格式字段，无法仅凭该记录判断缺少哪项或哪项类型错误。'}原记录未因格式错误被覆盖。可在“姓名与岗位核对”重新分析所选记录，或对照原件人工填写后确认；诊断只记录字段类别，不保存模型取值。</div>`;
+  }
+  if(row.error_code==='DUPLICATE_APPLICATION')return '<div class="notice mt-small">同一简历原件已有目标岗位申请，已停止写入以保留各自的评分和人工跟进。请在候选人库对照原始文件和岗位核对两条记录；系统不会自动合并或删除。</div>';
   const kind=diagnosticMapped(diagnosticValidationKinds,row.validation_kind),reason=diagnosticMapped(diagnosticEvidenceReasons,row.evidence_reason);
   const dimension=diagnosticMapped(diagnosticDimensions,row.criterion_dimension),field=diagnosticMapped(diagnosticFacts,row.fact_field);
   const labels=[kind,dimension&&'评分维度：'+dimension,field&&'事实字段：'+field].filter(Boolean);
@@ -27,11 +36,12 @@ function diagnosticExplanation(row,waiting){
   return '';
 }
 function diagnosticRecord(row){
-  const waiting=row.event==='PHASE_WAITING'||(row.event==='PHASE_FAILED'&&row.error_code==='IDENTITY_REVIEW_REQUIRED');
-  const failed=!waiting&&String(row.event).endsWith('FAILED');
-  const eventLabel=waiting?'等待人工核对':diagnosticEvents[row.event]||row.event;
+  const paused=row.error_code==='BATCH_STOPPED';
+  const waiting=!paused&&(row.event==='PHASE_WAITING'||(row.event==='PHASE_FAILED'&&row.error_code==='IDENTITY_REVIEW_REQUIRED'));
+  const failed=!waiting&&!paused&&String(row.event).endsWith('FAILED');
+  const eventLabel=paused?'随批次暂停':waiting?'等待人工核对':diagnosticEvents[row.event]||row.event;
   const numbers=Object.entries(diagnosticNumbers).filter(([key])=>row[key]!==undefined).map(([key,label])=>`<span>${E(label)}：<b>${E(row[key])}</b></span>`).join('');
-  return `<tr class="${failed?'diagnostic-failed':''}"><td>${stamp(row.timestamp)}<p class="tiny muted">${E(row.request_id?.slice(0,8)||row.trace_id?.slice(0,8)||'')}</p></td><td><b>${E(diagnosticPhases[row.phase]||row.phase)}</b><p>${E(eventLabel)}</p>${row.application_id?`<p class="tiny muted">记录 ${E(row.application_id.slice(0,8))}</p>`:''}${row.jd_import_id?`<p class="tiny muted">JD ${E(row.jd_import_id.slice(0,8))}</p>`:''}</td><td>${row.error_code?`<p class="${waiting?'tiny muted':'error-message'}">${E(row.error_code)}</p>`:''}${diagnosticExplanation(row,waiting)}${row.model_step?`<p class="tiny muted">模型步骤：${E(row.model_step==='review'?'第二步 · 语义复核':'第一步 · 分析')}</p>`:''}<div class="diagnostic-metrics">${numbers||'—'}</div>${row.reasoning_effort?`<p class="tiny muted">思考强度：${E(({default:'沿用供应商默认',low:'轻量 low',high:'增强 high',max:'深度 max'})[row.reasoning_effort]||row.reasoning_effort)}</p>`:''}${row.finish_reason?`<p class="tiny muted">结束原因：${E(row.finish_reason)}</p>`:''}<details class="mt-small"><summary>查看技术元数据</summary><pre class="diagnostic-json">${E(JSON.stringify(row,null,2))}</pre></details></td></tr>`;
+  return `<tr class="${failed?'diagnostic-failed':''}"><td>${stamp(row.timestamp)}<p class="tiny muted">${E(row.request_id?.slice(0,8)||row.trace_id?.slice(0,8)||'')}</p></td><td><b>${E(diagnosticPhases[row.phase]||row.phase)}</b><p>${E(eventLabel)}</p>${row.application_id?`<p class="tiny muted">记录 ${E(row.application_id.slice(0,8))}</p>`:''}${row.jd_import_id?`<p class="tiny muted">JD ${E(row.jd_import_id.slice(0,8))}</p>`:''}</td><td>${row.error_code?`<p class="${waiting||paused?'tiny muted':'error-message'}">${E(row.error_code)}</p>`:''}${diagnosticExplanation(row,waiting)}${row.model_step?`<p class="tiny muted">模型步骤：${E(row.model_step==='review'?'第二步 · 语义复核':'第一步 · 分析')}</p>`:''}<div class="diagnostic-metrics">${numbers||'—'}</div>${row.reasoning_effort?`<p class="tiny muted">思考强度：${E(({default:'沿用供应商默认',low:'轻量 low',high:'增强 high',max:'深度 max'})[row.reasoning_effort]||row.reasoning_effort)}</p>`:''}${row.finish_reason?`<p class="tiny muted">结束原因：${E(row.finish_reason)}</p>`:''}<details class="mt-small"><summary>查看技术元数据</summary><pre class="diagnostic-json">${E(JSON.stringify(row,null,2))}</pre></details></td></tr>`;
 }
 async function diagnosticsPage(){
   const [status,runs]=await Promise.all([api('/diagnostics'),api('/runs')]);

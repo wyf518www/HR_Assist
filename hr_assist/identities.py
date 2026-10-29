@@ -52,6 +52,89 @@ class IdentityResult(Input):
     role: IdentityRole
 
 
+IDENTITY_SCHEMA_FIELDS = {
+    'root': '整体结构', 'root.extra': '整体结构中的额外字段', 'unknown': '未分类结构字段',
+    'name': '姓名结构', 'name.status': '姓名识别状态', 'name.value': '姓名取值',
+    'name.note': '姓名识别说明', 'name.evidence': '姓名证据列表',
+    'name.evidence.item': '姓名证据条目', 'name.evidence.span_id': '姓名证据来源编号',
+    'name.evidence.interpretation': '姓名证据解读', 'name.evidence.extra': '姓名证据中的额外字段',
+    'name.extra': '姓名结构中的额外字段',
+    'role': '应聘岗位结构', 'role.status': '岗位识别状态', 'role.value': '岗位取值',
+    'role.note': '岗位识别说明', 'role.role_id': '岗位编号', 'role.evidence': '岗位证据列表',
+    'role.evidence.item': '岗位证据条目', 'role.evidence.span_id': '岗位证据来源编号',
+    'role.evidence.interpretation': '岗位证据解读', 'role.evidence.extra': '岗位证据中的额外字段',
+    'role.extra': '岗位结构中的额外字段',
+}
+IDENTITY_SCHEMA_ERRORS = {
+    'missing': '缺少必填字段', 'invalid_choice': '取值不在允许范围',
+    'invalid_type': '字段类型不正确', 'length_limit': '长度或数量不符合限制',
+    'unexpected_field': '包含格式约定以外的字段', 'invalid_format': '字段格式不合法',
+}
+
+
+def _identity_schema_field(location):
+    """Map a validation path to constants; unknown key names are never returned."""
+    if not location:
+        return 'root', None
+    if location[0] not in ('name', 'role'):
+        return 'root.extra', None
+    group = location[0]
+    if len(location) == 1:
+        return group, None
+    key = location[1]
+    if key == 'evidence':
+        index = location[2] + 1 if len(location) > 2 and type(location[2]) is int and 0 <= location[2] < 1000 else None
+        if len(location) == 2:
+            return group + '.evidence', index
+        if len(location) == 3 and type(location[2]) is int:
+            return group + '.evidence.item', index
+        if len(location) == 4 and type(location[2]) is int and location[3] in ('span_id', 'interpretation'):
+            return group + '.evidence.' + location[3], index
+        return group + '.evidence.extra', index
+    if len(location) == 2 and (key in ('status', 'value', 'note') or (group == 'role' and key == 'role_id')):
+        return group + '.' + key, None
+    return group + '.extra', None
+
+
+def _identity_schema_diagnostic(error):
+    """Only fixed field/error categories and bounded counts escape validation.
+
+    Pydantic error messages, inputs, context, and extra-field names may contain
+    resume data. None are used in the public message or diagnostic metadata.
+    """
+    classifications = []
+    for entry in error.errors(include_input=False, include_context=False, include_url=False)[:6]:
+        field, index = _identity_schema_field(entry.get('loc', ()))
+        kind = entry.get('type')
+        if kind == 'missing':
+            category = 'missing'
+        elif kind in ('literal_error', 'enum'):
+            category = 'invalid_choice'
+        elif kind in ('string_type', 'list_type', 'model_type', 'model_attributes_type', 'dict_type'):
+            category = 'invalid_type'
+        elif kind in ('string_too_long', 'string_too_short', 'too_long', 'too_short'):
+            category = 'length_limit'
+        elif kind == 'extra_forbidden':
+            category = 'unexpected_field'
+        else:
+            category = 'invalid_format'
+        classifications.append((field, category, index))
+    if not classifications:
+        classifications.append(('unknown', 'invalid_format', None))
+    field, category, index = classifications[0]
+    count = max(1, min(error.error_count(), 1000))
+    details = {'validation_kind': 'identity_schema', 'model_step': 'review',
+               'identity_schema_field': field, 'identity_schema_error': category,
+               'identity_schema_error_count': count}
+    if index is not None:
+        details['identity_evidence_index'] = index
+    descriptions = [IDENTITY_SCHEMA_FIELDS[field] + (f'（第{index}条）' if index is not None else '')
+                    + '：' + IDENTITY_SCHEMA_ERRORS[category] for field, category, index in classifications]
+    suffix = '；还有其他格式问题' if count > len(classifications) else ''
+    message = '姓名与岗位识别的模型复核结果格式无效：' + '；'.join(descriptions) + suffix + '。原记录未改动，请重试；提示不含模型原文或字段取值。'
+    return message, details
+
+
 def private_contact_filter(text):
     # Identity extraction necessarily retains names. Other contact/ID data is
     # not needed and is never included in its model request.
@@ -66,7 +149,8 @@ def validate_identity(raw, sources, roles):
     try:
         result=IdentityResult.model_validate(raw)
     except ValidationError as exc:
-        raise BusinessError('IDENTITY_SCHEMA','姓名与岗位识别结果格式无效，原记录未改动；请重试。') from exc
+        message, details = _identity_schema_diagnostic(exc)
+        raise BusinessError('IDENTITY_SCHEMA', message, diagnostics=details) from exc
     role_ids={r['id'] for r in roles}
     bound={}
     for key in ('name','role'):
